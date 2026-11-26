@@ -42,6 +42,43 @@ logger = logging.getLogger(__name__)
 DATALOADER_STATE_PREFIX = "lance_dataloader_state"
 
 
+DEFAULT_WORKER_PRELOAD: tuple[str, ...] = (
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "torch",
+    "transformers",
+    "lerobot_lancedb",
+    "gr00t_lancedb",
+)
+
+
+def prewarm_lance_workers(extra_modules: Sequence[str] = ()) -> str:
+    """Start the ``forkserver`` now, with heavy modules pre-imported, and return the context name.
+
+    Lance's Rust/Tokio runtime is not fork-safe, so DataLoader workers must use ``forkserver``
+    (or ``spawn``) instead of GR00T's default ``fork``. Without preloading, every worker
+    re-imports torch / transformers / GR00T from scratch when the first batch is requested
+    (~60 s for 4 workers on a slow filesystem). Calling this at program start makes the
+    forkserver import those modules *once*, in parallel with model loading; workers are
+    then cheap ``fork()``s of that warm, Lance-free server.
+
+    Only modules that do not open Lance datasets at import time may be preloaded.
+    """
+    import multiprocessing as mp
+
+    ctx_name = lance_mp_context()
+    if ctx_name != "forkserver":
+        return ctx_name
+    from multiprocessing import forkserver
+
+    modules = list(dict.fromkeys([*DEFAULT_WORKER_PRELOAD, *extra_modules]))
+    mp.get_context("forkserver").set_forkserver_preload(modules)
+    forkserver.ensure_running()
+    logger.info("Pre-warmed forkserver for Lance dataloader workers (preload=%s)", modules)
+    return ctx_name
+
+
 def dataloader_state_path(checkpoint_dir: str | Path, rank: int = 0) -> Path:
     return Path(checkpoint_dir) / f"{DATALOADER_STATE_PREFIX}_rank{rank}.json"
 
@@ -250,8 +287,15 @@ def make_hf_spot_callback(
     *,
     monitor: SpotPreemptionMonitor | None = None,
     on_checkpoint_saved: Callable[[Path], None] | None = None,
+    exit_on_preempt: bool = True,
 ):
     """Build a HuggingFace ``TrainerCallback`` for ``Gr00tTrainer`` Spot preemption & cursor saving.
+
+    On ``SIGTERM``/``SIGUSR1`` the current step finishes, a full checkpoint plus the exact
+    dataloader cursor is written, and (with ``exit_on_preempt``) the process exits with
+    status 143 right after training stops, so the caller's post-training work (e.g. GR00T's
+    final ``save_model()``, another multi-GB write) does not eat into the provider's
+    preemption grace period.
 
     Lazily imports ``transformers.TrainerCallback`` so the package stays lightweight when
     ``transformers`` is not installed.
@@ -285,6 +329,12 @@ def make_hf_spot_callback(
 
         def on_train_end(self, args, state, control, **kwargs):
             self.monitor.restore()
+            if self.monitor.preempted and exit_on_preempt:
+                logger.warning(
+                    "Preempted at step %d: checkpoint + dataloader cursor saved; exiting (143).",
+                    state.global_step,
+                )
+                raise SystemExit(143)
             return control
 
     return LanceSpotPreemptionCallback()
@@ -365,6 +415,8 @@ def create_spot_resumable_gr00t_trainer_class(base_trainer_cls: type):
 
 __all__ = [
     "DATALOADER_STATE_PREFIX",
+    "DEFAULT_WORKER_PRELOAD",
+    "prewarm_lance_workers",
     "SpotPreemptionMonitor",
     "build_lance_mixture_dataset",
     "create_spot_resumable_gr00t_trainer_class",

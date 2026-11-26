@@ -340,7 +340,6 @@ def _build_v3_compatible_meta_dir(
         "data_path": V3_DATA_PATH_TEMPLATE,
         "video_path": V3_VIDEO_PATH_TEMPLATE if video_keys else None,
         "features": features_v3,
-        "gr00t_source_codebase_version": info_v2.get("codebase_version", "v2.1"),
     }
     if external_bases:
         info_v3["lance_external_bases"] = external_bases

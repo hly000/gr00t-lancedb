@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
-from ._gr00t_compat import (
+# Must run before anything imports lerobot / lerobot_lancedb (see _hub_compat docstring).
+from ._hub_compat import ensure_hub_compat
+
+ensure_hub_compat()
+
+from ._gr00t_compat import (  # noqa: E402
     HAS_GROOT,
     BaseProcessor,
     EmbodimentTag,
@@ -30,6 +35,7 @@ from .trainer_integration import (
     create_spot_resumable_gr00t_trainer_class,
     load_dataloader_state,
     make_hf_spot_callback,
+    prewarm_lance_workers,
     save_dataloader_state,
 )
 
@@ -60,5 +66,6 @@ __all__ = [
     "load_gr00t_meta_bundle",
     "make_hf_spot_callback",
     "merge_statistics",
+    "prewarm_lance_workers",
     "save_dataloader_state",
 ]

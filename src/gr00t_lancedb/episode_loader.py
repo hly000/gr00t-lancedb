@@ -669,7 +669,12 @@ class LanceEpisodeLoader:
         for pool_name in ("_prefetch_pool", "_decode_pool"):
             pool = getattr(self.reader, pool_name, None)
             if pool is not None:
-                pool.shutdown(wait=True, cancel_futures=True)
+                try:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                except Exception:
+                    # During Python interpreter teardown, concurrent.futures internals
+                    # may already be cleared.
+                    pass
                 setattr(self.reader, pool_name, None)
 
 

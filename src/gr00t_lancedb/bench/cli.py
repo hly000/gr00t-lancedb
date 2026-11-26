@@ -22,6 +22,10 @@ from .fault_injector import (
 )
 
 
+def _identity_collate(items: list) -> list:
+    return items
+
+
 def _cmd_throughput(args: argparse.Namespace) -> None:
     modality_configs = {
         "video": ModalityConfig(delta_indices=[0], modality_keys=args.video_keys),
@@ -56,7 +60,7 @@ def _cmd_throughput(args: argparse.Namespace) -> None:
     peak_rss = measure_process_rss_mb()
 
     for step_idx, batch in enumerate(
-        mix.loader(num_workers=args.num_workers, collate_fn=lambda xs: xs)
+        mix.loader(num_workers=args.num_workers, collate_fn=_identity_collate)
     ):
         now = time.perf_counter()
         if t_first is None:

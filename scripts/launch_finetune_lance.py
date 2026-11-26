@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+"""Run NVIDIA Isaac-GR00T's *official* ``launch_finetune.py`` with an optional Lance data backend.
+
+Everything (model, processor, hyper-parameters, CLI flags) comes from GR00T itself; this
+wrapper only swaps two seams so native and Lance runs are apples-to-apples:
+
+1. ``DatasetFactory.build``  -> ``ResumableLanceMixtureDataset`` over ``LanceShardedSingleStepDataset``
+   (only when ``GR00T_DATA_BACKEND=lance``; ``--dataset-path`` then points at Lance roots,
+   local dirs or ``s3://`` URIs).
+2. ``Gr00tTrainer``          -> ``SpotResumableGr00tTrainer`` (exact dataloader cursor resume +
+   SIGTERM handling) when the backend is ``lance``.
+
+In both modes a ``BenchMetricsCallback`` appends one JSON line per optimizer step to
+``$GR00T_BENCH_METRICS`` (default ``<output_dir>/bench_metrics.jsonl``) with wall time,
+time spent waiting for the next batch, host RSS (incl. dataloader workers) and GPU util.
+
+Usage::
+
+    GR00T_DATA_BACKEND=native python scripts/launch_finetune_lance.py \
+        --gr00t-root /data/Isaac-GR00T -- \
+        --base-model-path nvidia/GR00T-N1.7-3B --dataset-path /data/datasets/libero_10 \
+        --embodiment-tag LIBERO_PANDA --output-dir /data/runs/native ...
+
+    GR00T_DATA_BACKEND=lance python scripts/launch_finetune_lance.py \
+        --gr00t-root /data/Isaac-GR00T -- \
+        --base-model-path nvidia/GR00T-N1.7-3B --dataset-path /data/datasets/libero_10_lance \
+        --embodiment-tag LIBERO_PANDA --output-dir /data/runs/lance ...
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import threading
+import time
+
+import numpy as np
+
+logger = logging.getLogger("gr00t_lancedb.launch")
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+class _GpuSampler(threading.Thread):
+    """Samples GPU utilisation / memory with ``nvidia-smi`` every ``interval`` seconds."""
+
+    def __init__(self, interval: float = 1.0) -> None:
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.samples: list[tuple[float, float, float]] = []  # (t, util%, mem_MiB)
+        self._halt = threading.Event()
+
+    def run(self) -> None:
+        dev = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0"
+        while not self._halt.is_set():
+            try:
+                out = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        f"--id={dev}",
+                        "--query-gpu=utilization.gpu,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+                util, mem = (float(x) for x in out.split(",")[:2])
+                self.samples.append((time.time(), util, mem))
+            except Exception:  # noqa: BLE001 - metrics must never kill training
+                pass
+            self._halt.wait(self.interval)
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def window(self, t0: float, t1: float) -> tuple[float | None, float | None]:
+        sel = [(u, m) for (t, u, m) in self.samples if t0 <= t <= t1]
+        if not sel:
+            return None, None
+        return float(np.mean([u for u, _ in sel])), float(max(m for _, m in sel))
+
+
+def _memory_mb(full: bool) -> dict[str, float]:
+    """Host memory of the training process tree, in MiB.
+
+    ``pss_tree_mb`` (proportional set size, summed over this process and all dataloader
+    workers) counts shared pages once, unlike summed RSS which double-counts fork-shared
+    memory. It is expensive (reads smaps), so it is only sampled when ``full`` is set.
+    ``sys_used_mb`` is machine-wide used memory (meaningful on a dedicated box).
+    """
+    out: dict[str, float] = {}
+    try:
+        import psutil
+
+        out["sys_used_mb"] = (psutil.virtual_memory().total - psutil.virtual_memory().available) / 2**20
+        proc = psutil.Process()
+        out["main_rss_mb"] = proc.memory_info().rss / 2**20
+        if full:
+            procs = [proc, *proc.children(recursive=True)]
+            pss = 0
+            for pr in procs:
+                try:
+                    pss += pr.memory_full_info().pss
+                except (psutil.Error, AttributeError):
+                    pass
+            out["pss_tree_mb"] = pss / 2**20
+            out["num_procs"] = float(len(procs))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def make_bench_callback(metrics_path: Path, launch_t0: float, loss_box: dict):
+    from transformers import TrainerCallback
+
+    class BenchMetricsCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.gpu = _GpuSampler()
+            self.gpu.start()
+            self.fh = None
+            self.t_prev_end: float | None = None
+            self.t_step_begin: float | None = None
+            self.data_wait = 0.0
+            self.peak = {"sys_used_mb": 0.0, "pss_tree_mb": 0.0, "main_rss_mb": 0.0}
+
+        def _write(self, rec: dict) -> None:
+            if self.fh is None:
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                self.fh = open(metrics_path, "a", encoding="utf-8")
+            self.fh.write(json.dumps(rec) + "\n")
+            self.fh.flush()
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.t_prev_end = time.time()
+            self._write(
+                {
+                    "event": "train_begin",
+                    "t": self.t_prev_end,
+                    "since_launch_s": self.t_prev_end - launch_t0,
+                    "global_step": int(state.global_step),
+                    "backend": os.environ.get("GR00T_DATA_BACKEND", "native"),
+                }
+            )
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            now = time.time()
+            # Only the first micro-step of an optimizer step waits on the dataloader after
+            # the previous optimizer step finished (HF prefetches the rest via get_batch_samples).
+            if self.t_step_begin is None and self.t_prev_end is not None:
+                self.data_wait = now - self.t_prev_end
+                self.t_step_begin = now
+
+        def on_step_end(self, args, state, control, **kwargs):
+            now = time.time()
+            mem = _memory_mb(full=state.global_step % 10 == 0 or state.global_step <= 2)
+            for k in self.peak:
+                if k in mem:
+                    self.peak[k] = max(self.peak[k], mem[k])
+            t0 = self.t_prev_end or now
+            util, gmem = self.gpu.window(t0, now)
+            rec = {
+                "event": "step",
+                "global_step": int(state.global_step),
+                "t": now,
+                "since_launch_s": now - launch_t0,
+                "step_s": now - t0,
+                "data_wait_s": self.data_wait,
+                **mem,
+                "gpu_util": util,
+                "gpu_mem_mb": gmem,
+            }
+            if "loss" in loss_box:
+                # Raw per-step training loss (GR00T only logs a smoothed value every N steps).
+                rec["step_loss"] = loss_box.pop("loss")
+            self._write(rec)
+            self.t_prev_end = now
+            self.t_step_begin = None
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and "loss" in logs:
+                self._write({"event": "log", "global_step": int(state.global_step), "t": time.time(), **logs})
+
+        def on_train_end(self, args, state, control, **kwargs):
+            self._write(
+                {
+                    "event": "train_end",
+                    "t": time.time(),
+                    "since_launch_s": time.time() - launch_t0,
+                    "global_step": int(state.global_step),
+                    "peak": self.peak,
+                }
+            )
+            self.gpu.stop()
+            if self.fh:
+                self.fh.close()
+                self.fh = None
+
+    return BenchMetricsCallback()
+
+
+# ---------------------------------------------------------------------------
+# Lance dataset factory
+# ---------------------------------------------------------------------------
+
+
+def _lance_build(self, processor):  # bound as DatasetFactory.build
+    from gr00t.data.embodiment_tags import EmbodimentTag
+
+    from gr00t_lancedb import LanceShardedSingleStepDataset, ResumableLanceMixtureDataset
+
+    cfg = self.config
+    assert cfg.training.eval_strategy == "no", "Sharded dataset does not support evaluation sets"
+
+    all_datasets, all_weights = [], []
+    for spec in cfg.data.datasets:
+        emb = spec.embodiment_tag
+        group = []
+        for path in spec.dataset_paths:
+            # Stats (q01/q99, relative stats) are pre-computed into meta.lance at conversion
+            # time, so the rank-0 generate_stats() pass over local parquet is skipped.
+            group.append(
+                LanceShardedSingleStepDataset(
+                    dataset_path=path,
+                    embodiment_tag=EmbodimentTag(emb),
+                    modality_configs=cfg.data.modality_configs[emb],
+                    shard_size=cfg.data.shard_size,
+                    episode_sampling_rate=cfg.data.episode_sampling_rate,
+                    seed=cfg.data.seed,
+                    allow_padding=cfg.data.allow_padding,
+                )
+            )
+        lengths = np.array([len(ds) for ds in group], dtype=np.float64)
+        for ds, rel in zip(group, lengths / lengths.sum()):
+            all_datasets.append(ds)
+            all_weights.append(float(rel) * spec.mix_ratio)
+
+    per_device_bs = (
+        cfg.training.per_gpu_batch_size
+        if cfg.training.per_gpu_batch_size is not None
+        else cfg.training.global_batch_size // cfg.training.num_gpus
+    )
+    mix = ResumableLanceMixtureDataset(
+        datasets=all_datasets,
+        weights=all_weights,
+        processor=processor,
+        seed=cfg.data.seed,
+        batch_size=per_device_bs,
+        episode_pool_size=int(os.environ.get("GR00T_LANCE_EPISODE_POOL", "16")),
+        prefetch_anchors=int(os.environ.get("GR00T_LANCE_PREFETCH", "16")),
+        ds_weights_alpha=cfg.data.ds_weights_alpha,
+        override_pretraining_statistics=cfg.data.override_pretraining_statistics,
+        infinite=True,
+    )
+    return mix, None
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    launch_t0 = time.time()
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--gr00t-root", default=os.environ.get("GR00T_ROOT", "/data/Isaac-GR00T"))
+    p.add_argument("gr00t_args", nargs=argparse.REMAINDER, help="Arguments after `--` go to launch_finetune.py")
+    args = p.parse_args()
+    gr00t_args = args.gr00t_args[1:] if args.gr00t_args[:1] == ["--"] else args.gr00t_args
+
+    backend = os.environ.get("GR00T_DATA_BACKEND", "native").lower()
+    assert backend in ("native", "lance"), backend
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if backend == "lance" and os.environ.get("GR00T_LANCE_PREWARM", "1") == "1":
+        # Start the forkserver before the heavy GR00T/model imports so worker-side imports
+        # overlap with model loading instead of delaying the first batch.
+        from gr00t_lancedb import prewarm_lance_workers
+
+        prewarm_lance_workers(
+            extra_modules=(
+                "gr00t.data.types",
+                "gr00t.data.embodiment_tags",
+                "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7",
+            )
+        )
+
+    import gr00t.experiment.experiment as gexp
+    from gr00t.data.dataset import factory as gfactory
+
+    if backend == "lance":
+        from gr00t_lancedb import create_spot_resumable_gr00t_trainer_class
+
+        gfactory.DatasetFactory.build = _lance_build
+        base_trainer = gexp.Gr00tTrainer
+    else:
+        base_trainer = gexp.Gr00tTrainer
+
+    # Attach the metrics callback to whichever trainer runs.
+    def _output_dir_from_args() -> Path:
+        out = "./outputs"
+        exp = None
+        for i, a in enumerate(gr00t_args):
+            if a in ("--output-dir", "--output_dir") and i + 1 < len(gr00t_args):
+                out = gr00t_args[i + 1]
+            if a in ("--experiment-name", "--experiment_name") and i + 1 < len(gr00t_args):
+                exp = gr00t_args[i + 1]
+        return Path(out) / exp if exp else Path(out)
+
+    metrics_path = Path(os.environ.get("GR00T_BENCH_METRICS", str(_output_dir_from_args() / "bench_metrics.jsonl")))
+    trainer_cls = create_spot_resumable_gr00t_trainer_class(base_trainer) if backend == "lance" else base_trainer
+
+    class BenchTrainer(trainer_cls):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._bench_loss: dict = {}
+            self.add_callback(make_bench_callback(metrics_path, launch_t0, self._bench_loss))
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            out = super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+            loss = out[0] if return_outputs else out
+            if model.training:
+                self._bench_loss["loss"] = float(loss.detach().float().item())
+            return out
+
+    BenchTrainer.__name__ = f"Bench{trainer_cls.__name__}"
+    gexp.Gr00tTrainer = BenchTrainer
+
+    script = Path(args.gr00t_root) / "gr00t" / "experiment" / "launch_finetune.py"
+    sys.argv = [str(script), *gr00t_args]
+    logger.info("backend=%s metrics=%s argv=%s", backend, metrics_path, sys.argv)
+    runpy.run_path(str(script), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
