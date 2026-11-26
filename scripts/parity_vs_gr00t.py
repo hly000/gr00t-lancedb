@@ -28,6 +28,10 @@ import numpy as np
 def _deep_compare(a: Any, b: Any, path: str = "") -> list[str]:
     errs: list[str] = []
     if isinstance(a, dict) and isinstance(b, dict):
+        # An empty sub-dict means "no entries" — GR00T caches an empty relative_stats.json
+        # (relative_action: {}) for embodiments without relative actions.
+        a = {k: v for k, v in a.items() if not (isinstance(v, dict) and not v)}
+        b = {k: v for k, v in b.items() if not (isinstance(v, dict) and not v)}
         if set(a) != set(b):
             errs.append(f"{path}: key mismatch {sorted(set(a) ^ set(b))}")
         for k in set(a) & set(b):

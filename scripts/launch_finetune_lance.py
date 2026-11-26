@@ -247,6 +247,23 @@ def make_bench_callback(metrics_path: Path, launch_t0: float, loss_box: dict):
 # ---------------------------------------------------------------------------
 
 
+_URI_SCHEMES = ("s3", "gs", "gcs", "az", "abfs", "hf", "file", "http", "https")
+
+
+def _rejoin_uris(paths: list) -> list:
+    """Undo ``launch_finetune.py``'s ``split(os.pathsep)`` on URIs: ["s3", "//b/k"] -> ["s3://b/k"]."""
+    out, i = [], 0
+    while i < len(paths):
+        p = str(paths[i])
+        if p in _URI_SCHEMES and i + 1 < len(paths) and str(paths[i + 1]).startswith("//"):
+            out.append(f"{p}:{paths[i + 1]}")
+            i += 2
+        else:
+            out.append(p)
+            i += 1
+    return out
+
+
 def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.build
     """Mirror ``DatasetFactory.build`` (fast loader) but with the exact-resume mixture.
 
@@ -274,7 +291,7 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
     for spec in cfg.data.datasets:
         emb = spec.embodiment_tag
         group = []
-        for path in spec.dataset_paths:
+        for path in _rejoin_uris(list(spec.dataset_paths)):
             common = dict(
                 dataset_path=path,
                 embodiment_tag=EmbodimentTag(emb),

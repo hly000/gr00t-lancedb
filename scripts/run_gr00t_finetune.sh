@@ -25,6 +25,12 @@ SEED_ARGS=()
 
 # Box-local cache/env settings (HF_HOME, UV_CACHE_DIR, ...), if present.
 [ -f "${GR00T_ENV_FILE:-/data/env.sh}" ] && source "${GR00T_ENV_FILE:-/data/env.sh}"
+# Optional object-store credentials (S3 or S3-compatible, e.g. GCS HMAC via
+# AWS_ENDPOINT_URL=https://storage.googleapis.com). Lance's object_store reads AWS_ENDPOINT.
+if [ -n "${S3_ENV_FILE:-}" ]; then
+  set -a; source "$S3_ENV_FILE"; set +a
+  [ -n "${AWS_ENDPOINT_URL:-}" ] && export AWS_ENDPOINT="${AWS_ENDPOINT:-$AWS_ENDPOINT_URL}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export GR00T_DATA_BACKEND="$BACKEND"
 # Resuming loads optimizer state on top of a ~39 GB working set on a 40 GB A100; without
