@@ -1,0 +1,64 @@
+# SkyPilot AWS Spot GPU recipe for GR00T + LanceDB Hybrid / Full-S3 training.
+# Keep S3 bucket and Spot instances in the SAME AWS region (zero data-transfer egress fees).
+#
+# Launch with:
+#   sky jobs launch examples/skypilot_spot_s3.yaml \
+#     --env S3_LANCE_URI=s3://your-bucket/droid-lance \
+#     --env S3_CKPT_BUCKET=your-bucket
+
+name: gr00t-lancedb-spot
+
+resources:
+  cloud: aws
+  region: us-east-1          # Match your S3 bucket region!
+  accelerators: L40S:1       # Or A100:1 / H100:1 / H100:8
+  use_spot: true
+  disk_size: 100             # Small root disk — no 370 GB MP4 download needed!
+
+envs:
+  S3_LANCE_URI: s3://CHANGE_ME/droid-lance
+  S3_CKPT_BUCKET: CHANGE_ME
+  BASE_MODEL: nvidia/GR00T-N1.6-3B
+  EMBODIMENT_TAG: oxe_droid
+  HYBRID_LOCAL_TABLES: "1"   # 1 = sync only small frames/videos/meta.lance (~GBs); MP4s stay on S3!
+  LANCE_IO_THREADS: "256"
+
+file_mounts:
+  /checkpoints:
+    name: ${S3_CKPT_BUCKET}
+    store: s3
+    mode: MOUNT
+
+setup: |
+  set -e
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  uv venv --python 3.12 .venv
+  uv pip install --python .venv/bin/python \
+    --prerelease=allow \
+    --extra-index-url https://pypi.fury.io/lancedb/ \
+    "gr00t-lancedb[s3]" "lerobot[dataset]>=0.7.0"
+
+run: |
+  set -e
+  source .venv/bin/activate
+  DATASET_URI="${S3_LANCE_URI}"
+
+  if [ "${HYBRID_LOCAL_TABLES}" = "1" ]; then
+    echo "Hybrid mode: syncing lightweight Lance metadata/frame tables to NVMe (MP4s stream from S3)..."
+    mkdir -p /tmp/lance-hybrid
+    aws s3 sync "${S3_LANCE_URI}" /tmp/lance-hybrid --only-show-errors
+    DATASET_URI="/tmp/lance-hybrid"
+  fi
+
+  torchrun --nproc_per_node="${SKYPILOT_NUM_GPUS_PER_NODE:-1}" \
+    examples/finetune_gr00t_lance.py \
+    --dataset-uri "${DATASET_URI}" \
+    --embodiment-tag "${EMBODIMENT_TAG}" \
+    --base-model-path "${BASE_MODEL}" \
+    --output-dir /checkpoints/gr00t-lancedb-run \
+    --max-steps 5000 \
+    --save-steps 200 \
+    --batch-size 8 \
+    --num-workers 4 \
+    --resume-if-available

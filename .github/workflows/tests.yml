@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg (<8 for torchcodec)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Create venv and install dependencies
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python \
+            --prerelease=allow \
+            --extra-index-url https://pypi.fury.io/lancedb/ \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match \
+            "git+https://github.com/lancedb/lerobot-lancedb.git#egg=lerobot-lancedb[s3]" \
+            "lerobot[dataset]>=0.7.0" \
+            "lancedb>=0.42.0b26" \
+            torchcodec boto3 pandas pytest "moto[server]"
+          uv pip install --python .venv/bin/python --no-deps -e .
+
+      - name: Run parity, S3 streaming, and Spot preemption tests
+        run: .venv/bin/pytest -v tests/

@@ -1,0 +1,32 @@
+# Reproducible Linux CUDA image pairing NVIDIA Isaac-GR00T + lerobot-lancedb + gr00t-lancedb.
+# Uses Ubuntu 24.04 (ships FFmpeg 6.1, compatible with torchcodec which requires FFmpeg < 8).
+FROM nvidia/cuda:12.4.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    LANCE_IO_THREADS=256
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3.12-dev \
+    git curl ca-certificates ffmpeg libavcodec-dev libavformat-dev libavutil-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /workspace
+COPY . /workspace/gr00t-lancedb
+
+RUN uv venv --python 3.12 /opt/venv \
+    && uv pip install --python /opt/venv/bin/python \
+       --prerelease=allow \
+       --extra-index-url https://pypi.fury.io/lancedb/ \
+       "git+https://github.com/lancedb/lerobot-lancedb.git#egg=lerobot-lancedb[s3]" \
+       "lerobot[dataset]>=0.7.0" \
+       "lancedb>=0.42.0b26" \
+       torchcodec \
+       -e "/workspace/gr00t-lancedb[cloud,dev]"
+
+ENV PATH="/opt/venv/bin:${PATH}"
+CMD ["pytest", "/workspace/gr00t-lancedb/tests"]
