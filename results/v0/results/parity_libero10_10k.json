@@ -1,0 +1,22 @@
+{
+  "v2_dir": "/data/datasets/libero_10",
+  "lance_dir": "/data/datasets/libero_10_lance",
+  "embodiment": "libero_sim",
+  "init_s": {
+    "native": 0.004,
+    "lance": 0.087
+  },
+  "num_episodes": {
+    "native": 379,
+    "lance": 379
+  },
+  "checked_episodes": 379,
+  "checked_steps": 10233,
+  "checked_frames": 20466,
+  "max_state_abs_err": 0.0,
+  "max_action_abs_err": 0.0,
+  "max_pixel_diff": 0,
+  "num_errors": 0,
+  "errors_head": [],
+  "pass": true
+}

@@ -1,0 +1,17 @@
+{
+  "batches": 24,
+  "batch_size": 8,
+  "num_workers": 2,
+  "resume_at": 9,
+  "stock_eq_exact_native": true,
+  "native_eq_lance": true,
+  "resumed_eq_tail": false,
+  "first_batch_s": {
+    "stock": 19.85,
+    "exact_native": 29.06,
+    "lance": 28.25,
+    "lance_resumed": 28.31
+  },
+  "distinct_samples_checked": 192,
+  "pass": false
+}

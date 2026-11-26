@@ -1,0 +1,5 @@
+{"t": 1795734629.828455097, "event": "dl_start", "rx_bytes": 26405523928, "run": "native_dl"}
+{"t": 1795734654.727120910, "event": "dl_end", "rx_bytes": 27057529251, "run": "native_dl", "bytes": 636417222}
+{"t": 1795734911.587006368, "event": "train_end", "rx_bytes": 27209973803, "run": "native_dl", "code": 0}
+{"t": 1795734911.751193718, "event": "train_start", "rx_bytes": 27209973803, "run": "lance_stream"}
+{"t": 1795735185.517587790, "event": "train_end", "rx_bytes": 27955505347, "run": "lance_stream", "code": 0}
