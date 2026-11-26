@@ -1,26 +1,21 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
-"""Run NVIDIA Isaac-GR00T's *official* ``launch_finetune.py`` with an optional Lance data backend.
+"""Run NVIDIA Isaac-GR00T's *official* ``launch_finetune.py`` with a selectable data backend.
 
 Everything (model, processor, hyper-parameters, CLI flags) comes from GR00T itself; this
-wrapper only swaps two seams so native and Lance runs are apples-to-apples:
+wrapper only swaps seams, selected by ``GR00T_DATA_BACKEND``:
 
-1. ``DatasetFactory.build``  -> ``ResumableLanceMixtureDataset`` over ``LanceShardedSingleStepDataset``
-   (only when ``GR00T_DATA_BACKEND=lance``; ``--dataset-path`` then points at Lance roots,
-   local dirs or ``s3://`` URIs).
-2. ``Gr00tTrainer``          -> ``SpotResumableGr00tTrainer`` (exact dataloader cursor resume +
-   SIGTERM handling) when the backend is ``lance``.
+``native``        stock GR00T (fast loader; resume reseeds with ``seed + global_step``)
+``native-exact``  GR00T's own fast datasets + ``ExactResumeFastShardedMixtureDataset`` and
+                  an exact-resume ``Gr00tTrainer`` (no Lance involved)
+``lance``         ``LanceShardedSingleStepDataset`` (local dir or ``s3://``) + the same
+                  exact-resume mixture/trainer; forkserver workers are pre-warmed
 
-In both modes a ``BenchMetricsCallback`` appends one JSON line per optimizer step to
-``$GR00T_BENCH_METRICS`` (default ``<output_dir>/bench_metrics.jsonl``) with wall time,
-time spent waiting for the next batch, host RSS (incl. dataloader workers) and GPU util.
+In every mode a ``BenchMetricsCallback`` appends one JSON line per optimizer step to
+``$GR00T_BENCH_METRICS`` (default ``<output_dir>/bench_metrics.jsonl``): wall time, time
+waiting for the batch, host memory, GPU util/memory and the raw per-step loss.
 
 Usage::
-
-    GR00T_DATA_BACKEND=native python scripts/launch_finetune_lance.py \
-        --gr00t-root /data/Isaac-GR00T -- \
-        --base-model-path nvidia/GR00T-N1.7-3B --dataset-path /data/datasets/libero_10 \
-        --embodiment-tag LIBERO_PANDA --output-dir /data/runs/native ...
 
     GR00T_DATA_BACKEND=lance python scripts/launch_finetune_lance.py \
         --gr00t-root /data/Isaac-GR00T -- \
@@ -214,53 +209,75 @@ def make_bench_callback(metrics_path: Path, launch_t0: float, loss_box: dict):
 # ---------------------------------------------------------------------------
 
 
-def _lance_build(self, processor):  # bound as DatasetFactory.build
-    from gr00t.data.embodiment_tags import EmbodimentTag
+def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.build
+    """Mirror ``DatasetFactory.build`` (fast loader) but with the exact-resume mixture.
 
-    from gr00t_lancedb import LanceShardedSingleStepDataset, ResumableLanceMixtureDataset
+    ``backend == "native-exact"`` keeps GR00T's own ``FastShardedSingleStepDataset`` over the
+    LeRobot v2.1 directory; ``backend == "lance"`` swaps in ``LanceShardedSingleStepDataset``.
+    Everything else — sharding, weights, shard schedule, shuffle buffer — is GR00T's code.
+    """
+    from gr00t.data.dataset.fast_sharded_dataset import (
+        FastShardedMixtureDataset,
+        FastShardedSingleStepDataset,
+        fast_loader_settings,
+    )
+    from gr00t.data.embodiment_tags import EmbodimentTag
+    from gr00t.data.stats import generate_rel_stats, generate_stats
+    from gr00t.utils.dist_utils import run_or_wait_on_rank0
+
+    from gr00t_lancedb import LanceShardedSingleStepDataset
+    from gr00t_lancedb.exact_resume import make_exact_resume_mixture_class
 
     cfg = self.config
     assert cfg.training.eval_strategy == "no", "Sharded dataset does not support evaluation sets"
+    fast = fast_loader_settings(cfg.data.fast_loader)
 
     all_datasets, all_weights = [], []
     for spec in cfg.data.datasets:
         emb = spec.embodiment_tag
         group = []
         for path in spec.dataset_paths:
-            # Stats (q01/q99, relative stats) are pre-computed into meta.lance at conversion
-            # time, so the rank-0 generate_stats() pass over local parquet is skipped.
-            group.append(
-                LanceShardedSingleStepDataset(
-                    dataset_path=path,
-                    embodiment_tag=EmbodimentTag(emb),
-                    modality_configs=cfg.data.modality_configs[emb],
-                    shard_size=cfg.data.shard_size,
-                    episode_sampling_rate=cfg.data.episode_sampling_rate,
-                    seed=cfg.data.seed,
-                    allow_padding=cfg.data.allow_padding,
-                )
+            common = dict(
+                dataset_path=path,
+                embodiment_tag=EmbodimentTag(emb),
+                modality_configs=cfg.data.modality_configs[emb],
+                shard_size=cfg.data.shard_size,
+                episode_sampling_rate=cfg.data.episode_sampling_rate,
+                seed=cfg.data.seed,
+                allow_padding=cfg.data.allow_padding,
             )
+            if backend == "lance":
+                # Stats were baked into meta.lance at conversion time: no rank-0 parquet scan.
+                group.append(LanceShardedSingleStepDataset(**common))
+            else:
+                with run_or_wait_on_rank0(label=f"generate_stats({path})") as is_rank0:
+                    if is_rank0:
+                        generate_stats(path)
+                        generate_rel_stats(path, EmbodimentTag(emb))
+                group.append(FastShardedSingleStepDataset(**common, ffmpeg_threads=fast["ffmpeg_threads"]))
         lengths = np.array([len(ds) for ds in group], dtype=np.float64)
         for ds, rel in zip(group, lengths / lengths.sum()):
             all_datasets.append(ds)
             all_weights.append(float(rel) * spec.mix_ratio)
 
-    per_device_bs = (
-        cfg.training.per_gpu_batch_size
-        if cfg.training.per_gpu_batch_size is not None
-        else cfg.training.global_batch_size // cfg.training.num_gpus
-    )
-    mix = ResumableLanceMixtureDataset(
+    alpha = cfg.data.ds_weights_alpha
+    if alpha is not None and len(all_datasets) > 1:
+        ds_lengths = np.array([len(d) for d in all_datasets], dtype=np.float64)
+        all_weights = (np.power(ds_lengths, alpha) / np.power(ds_lengths[0], alpha)).tolist()
+
+    mixture_cls = make_exact_resume_mixture_class(FastShardedMixtureDataset)
+    mix = mixture_cls(
         datasets=all_datasets,
         weights=all_weights,
         processor=processor,
         seed=cfg.data.seed,
-        batch_size=per_device_bs,
-        episode_pool_size=int(os.environ.get("GR00T_LANCE_EPISODE_POOL", "16")),
-        prefetch_anchors=int(os.environ.get("GR00T_LANCE_PREFETCH", "16")),
-        ds_weights_alpha=cfg.data.ds_weights_alpha,
+        training=True,
+        num_shards_per_epoch=cfg.data.num_shards_per_epoch,
         override_pretraining_statistics=cfg.data.override_pretraining_statistics,
-        infinite=True,
+        decode_threads=fast["decode_threads"],
+        shuffle_buffer=fast["shuffle_buffer"],
+        min_fill=fast["min_fill"],
+        per_sample_seed=os.environ.get("GR00T_PER_SAMPLE_SEED", "1") == "1",
     )
     return mix, None
 
@@ -279,7 +296,10 @@ def main() -> None:
     gr00t_args = args.gr00t_args[1:] if args.gr00t_args[:1] == ["--"] else args.gr00t_args
 
     backend = os.environ.get("GR00T_DATA_BACKEND", "native").lower()
-    assert backend in ("native", "lance"), backend
+    # native       : stock GR00T (fast loader; resume = reseed with seed + global_step)
+    # native-exact : GR00T's fast loader + datasets, exact-resume mixture/trainer
+    # lance        : Lance datasets + the same exact-resume mixture/trainer
+    assert backend in ("native", "native-exact", "lance"), backend
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     if backend == "lance" and os.environ.get("GR00T_LANCE_PREWARM", "1") == "1":
@@ -298,13 +318,14 @@ def main() -> None:
     import gr00t.experiment.experiment as gexp
     from gr00t.data.dataset import factory as gfactory
 
-    if backend == "lance":
-        from gr00t_lancedb import create_spot_resumable_gr00t_trainer_class
+    base_trainer = gexp.Gr00tTrainer
+    if backend in ("native-exact", "lance"):
+        from functools import partialmethod
 
-        gfactory.DatasetFactory.build = _lance_build
-        base_trainer = gexp.Gr00tTrainer
-    else:
-        base_trainer = gexp.Gr00tTrainer
+        from gr00t_lancedb.exact_resume import make_exact_resume_trainer_class
+
+        gfactory.DatasetFactory.build = partialmethod(_exact_build, backend=backend)
+        base_trainer = make_exact_resume_trainer_class(base_trainer)
 
     # Attach the metrics callback to whichever trainer runs.
     def _output_dir_from_args() -> Path:
@@ -318,10 +339,15 @@ def main() -> None:
         return Path(out) / exp if exp else Path(out)
 
     metrics_path = Path(os.environ.get("GR00T_BENCH_METRICS", str(_output_dir_from_args() / "bench_metrics.jsonl")))
-    trainer_cls = create_spot_resumable_gr00t_trainer_class(base_trainer) if backend == "lance" else base_trainer
+    trainer_cls = base_trainer
 
     class BenchTrainer(trainer_cls):  # type: ignore[misc, valid-type]
         def __init__(self, *a, **kw):
+            if backend == "lance" and kw.get("multiprocessing_context", "fork") == "fork":
+                # Lance's Rust/Tokio runtime is not fork-safe (prewarmed forkserver instead).
+                from lerobot_lancedb import lance_mp_context
+
+                kw["multiprocessing_context"] = lance_mp_context()
             super().__init__(*a, **kw)
             self._bench_loss: dict = {}
             self.add_callback(make_bench_callback(metrics_path, launch_t0, self._bench_loss))

@@ -4,6 +4,7 @@
 #
 #   BACKEND=native DATASET=/data/datasets/libero_10      OUT=/data/runs/native bash scripts/run_gr00t_finetune.sh
 #   BACKEND=lance  DATASET=/data/datasets/libero_10_lance OUT=/data/runs/lance  bash scripts/run_gr00t_finetune.sh
+#   BACKEND=native-exact ...   (GR00T data + exact-resume loader, no Lance)
 #
 # Extra launch_finetune.py flags can be appended after the script name.
 set -euo pipefail
@@ -19,6 +20,7 @@ MAX_STEPS="${MAX_STEPS:-200}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
 SEED_ARGS=()
 
 # Box-local cache/env settings (HF_HOME, UV_CACHE_DIR, ...), if present.
@@ -36,7 +38,7 @@ exec uv run --no-sync python "$HERE/launch_finetune_lance.py" --gr00t-root "$GR0
     --num_gpus 1 \
     --output_dir "$OUT" \
     --save_steps "$SAVE_STEPS" \
-    --save_total_limit 5 \
+    --save_total_limit "$SAVE_TOTAL_LIMIT" \
     --max_steps "$MAX_STEPS" \
     --warmup_ratio 0.05 \
     --weight_decay 1e-5 \

@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 import logging
 from pathlib import Path
 import random
+import threading
 from typing import Any
 
 import numpy as np
@@ -22,7 +23,22 @@ import torch
 from lerobot_lancedb import LanceDBDataset
 
 from ._gr00t_compat import EmbodimentTag, ModalityConfig, VLAStepData
-from .metadata import (
+# lancedb registers its blob Arrow extension type lazily on first table open; two threads
+# opening at once race on that registration ("lance.blob.v2 is already registered").
+_OPEN_LOCK = threading.Lock()
+
+
+def _fresh_reader(template: LanceDBDataset) -> LanceDBDataset:
+    """Unopened copy of ``template`` with its own table handles, pools and decoder caches."""
+    clone = object.__new__(type(template))
+    state = template.__getstate__()
+    if hasattr(clone, "__setstate__"):
+        clone.__setstate__(state)
+    else:
+        clone.__dict__.update(state)
+    return clone
+
+from .metadata import (  # noqa: E402
     DEFAULT_COLUMN_NAMES,
     LANG_KEYS,
     extract_dataset_statistics,
@@ -180,7 +196,7 @@ class LanceEpisodeLoader:
             projected_columns = [next(iter(available_features))]
 
         self._projected_columns = projected_columns
-        self.reader = LanceDBDataset(
+        self._reader_kwargs = dict(
             repo_id=repo_id,
             root=self.dataset_path,
             return_uint8=True,
@@ -191,12 +207,55 @@ class LanceEpisodeLoader:
             use_mini_mp4=self.use_mini_mp4,
             video_decoder_cache_size=self.video_decoder_cache_size,
         )
+        # One reader per thread: GR00T's fast loader decodes splits on a thread pool, and
+        # LanceDBDataset's decoder caches / prefetch state are not shared-thread safe.
+        self._reader0 = LanceDBDataset(**self._reader_kwargs)
+        self._init_thread_state()
 
         # Map GR00T episode positional idx -> Lance episode_index & bounds.
         self.episode_lengths = [int(ep["length"]) for ep in self.episodes_metadata]
         self._ep_id_to_pos = {
             int(ep["episode_index"]): pos for pos, ep in enumerate(self.episodes_metadata)
         }
+
+    # -- per-thread readers ---------------------------------------------------------
+    def _init_thread_state(self) -> None:
+        self._tls = threading.local()
+        self._readers_lock = threading.Lock()
+        self._thread_readers: list[LanceDBDataset] = []
+
+    @property
+    def reader(self) -> LanceDBDataset:
+        r = getattr(self._tls, "reader", None)
+        if r is None:
+            with self._readers_lock:
+                first = not self._thread_readers
+            # The first thread reuses the reader built in __init__; others get a clone made
+            # from its pickle state (fresh handles/caches, shared read-only metadata) —
+            # re-running LanceDBDataset.__init__ per thread would reload metadata.
+            r = self._reader0 if first else _fresh_reader(self._reader0)
+            with _OPEN_LOCK:
+                r._ensure_open()
+            with self._readers_lock:
+                self._thread_readers.append(r)
+            self._tls.reader = r
+        return r
+
+    @reader.setter
+    def reader(self, value: LanceDBDataset) -> None:
+        """Replace the base reader (e.g. a per-worker copy); thread readers start over."""
+        self._reader0 = value
+        self._init_thread_state()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        for k in ("_tls", "_readers_lock", "_thread_readers"):
+            state.pop(k, None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._init_thread_state()
 
     def __len__(self) -> int:
         return len(self.episodes_metadata)
@@ -666,16 +725,19 @@ class LanceEpisodeLoader:
         return outputs
 
     def close(self) -> None:
-        for pool_name in ("_prefetch_pool", "_decode_pool"):
-            pool = getattr(self.reader, pool_name, None)
-            if pool is not None:
-                try:
-                    pool.shutdown(wait=True, cancel_futures=True)
-                except Exception:
-                    # During Python interpreter teardown, concurrent.futures internals
-                    # may already be cleared.
-                    pass
-                setattr(self.reader, pool_name, None)
+        with self._readers_lock:
+            readers = list(self._thread_readers) or [self._reader0]
+        for reader in readers:
+            for pool_name in ("_prefetch_pool", "_decode_pool"):
+                pool = getattr(reader, pool_name, None)
+                if pool is not None:
+                    try:
+                        pool.shutdown(wait=True, cancel_futures=True)
+                    except Exception:
+                        # During Python interpreter teardown, concurrent.futures internals
+                        # may already be cleared.
+                        pass
+                    setattr(reader, pool_name, None)
 
 
 __all__ = ["LanceEpisodeLoader"]
