@@ -27,6 +27,9 @@ SEED_ARGS=()
 [ -f "${GR00T_ENV_FILE:-/data/env.sh}" ] && source "${GR00T_ENV_FILE:-/data/env.sh}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export GR00T_DATA_BACKEND="$BACKEND"
+# Resuming loads optimizer state on top of a ~39 GB working set on a 40 GB A100; without
+# this, fragmentation OOMs the resume (both backends).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # GR00T calls the Hub API (model_info) while building the backbone, so offline mode is not
 # usable; both backends pay the same small Hub round-trips at startup.
 

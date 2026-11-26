@@ -40,6 +40,9 @@ import numpy as np
 
 logger = logging.getLogger("gr00t_lancedb.launch")
 
+# Benchmark-only: skip the end-of-training checkpoint and GR00T's final save_model().
+SKIP_FINAL_SAVE = os.environ.get("GR00T_BENCH_SKIP_FINAL_SAVE", "0") == "1"
+
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -116,6 +119,35 @@ def _memory_mb(full: bool) -> dict[str, float]:
     return out
 
 
+def _batch_fingerprint(batch) -> str:
+    """Short hash of every tensor in a collated batch (strided sample, <=4096 values each).
+
+    Unaffected by GPU nondeterminism, so two runs that train on the same data in the same
+    order produce identical per-step fingerprints even when their losses drift apart.
+    """
+    import hashlib
+
+    import torch
+
+    h = hashlib.blake2b(digest_size=8)
+
+    def walk(obj, key: str) -> None:
+        if isinstance(obj, torch.Tensor):
+            flat = obj.detach().reshape(-1)
+            stride = max(1, flat.numel() // 4096)
+            h.update(key.encode())
+            h.update(flat[::stride].float().cpu().numpy().tobytes())
+        elif hasattr(obj, "items"):
+            for k in sorted(obj.keys(), key=str):
+                walk(obj[k], f"{key}.{k}")
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                walk(v, f"{key}[{i}]")
+
+    walk(batch, "")
+    return h.hexdigest()
+
+
 def make_bench_callback(metrics_path: Path, launch_t0: float, loss_box: dict):
     from transformers import TrainerCallback
 
@@ -178,9 +210,15 @@ def make_bench_callback(metrics_path: Path, launch_t0: float, loss_box: dict):
             if "loss" in loss_box:
                 # Raw per-step training loss (GR00T only logs a smoothed value every N steps).
                 rec["step_loss"] = loss_box.pop("loss")
+            if "fp" in loss_box:
+                rec["batch_fp"] = loss_box.pop("fp")
             self._write(rec)
             self.t_prev_end = now
             self.t_step_begin = None
+            if SKIP_FINAL_SAVE and state.global_step >= state.max_steps:
+                # Benchmark runs: skip HF's end-of-training checkpoint (~24 GB here).
+                control.should_save = False
+            return control
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs and "loss" in logs:
@@ -359,7 +397,14 @@ def main() -> None:
             loss = out[0] if return_outputs else out
             if model.training:
                 self._bench_loss["loss"] = float(loss.detach().float().item())
+                self._bench_loss["fp"] = _batch_fingerprint(inputs)
             return out
+
+        def save_model(self, output_dir=None, _internal_call=False):
+            if SKIP_FINAL_SAVE and not _internal_call:
+                logger.info("GR00T_BENCH_SKIP_FINAL_SAVE=1: skipping final save_model()")
+                return
+            return super().save_model(output_dir, _internal_call=_internal_call)
 
     BenchTrainer.__name__ = f"Bench{trainer_cls.__name__}"
     gexp.Gr00tTrainer = BenchTrainer
