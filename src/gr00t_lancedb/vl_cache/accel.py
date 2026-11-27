@@ -361,7 +361,7 @@ def build_action_head_optimizer(
     lr: float = 1e-4,
     weight_decay: float = 1e-5,
     use_8bit: bool = True,
-    betas: tuple[float, float] = (0.95, 0.999),
+    betas: tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
 ) -> tuple[Any, str]:
     """Build AdamW (preferring 8-bit AdamW when requested and available) for trainable params."""

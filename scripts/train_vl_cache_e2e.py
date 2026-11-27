@@ -66,26 +66,11 @@ def _build_processor_and_dataset(
         seed=42,
     )
     stats = ds.get_dataset_statistics()
-    processor = Gr00tN1d7Processor(
-        modality_configs={tag.value: modality_configs},
-        statistics={tag.value: stats},
-        use_percentiles=getattr(cfg, "use_percentiles", True),
-        image_crop_size=getattr(cfg, "image_crop_size", None),
-        image_target_size=getattr(cfg, "image_target_size", None),
-        shortest_image_edge=getattr(cfg, "shortest_image_edge", 256),
-        crop_fraction=getattr(cfg, "crop_fraction", 0.95),
-        random_rotation_angle=getattr(cfg, "random_rotation_angle", None),
-        color_jitter_params=getattr(cfg, "color_jitter_params", None),
-        formalize_language=getattr(cfg, "formalize_language", True),
-        model_name=cfg.model_name,
-        model_type=cfg.backbone_model_type,
-        max_state_dim=cfg.max_state_dim,
-        max_action_dim=cfg.max_action_dim,
-        max_action_horizon=cfg.action_horizon,
-        apply_sincos_state_encoding=getattr(cfg, "apply_sincos_state_encoding", False),
-        use_albumentations=getattr(cfg, "use_albumentations", True),
-        use_relative_action=getattr(cfg, "use_relative_action", False),
-    )
+    # Load the EXACT pretrained processor from base_model_path (preserving use_relative_action,
+    # action_configs, embodiment_id mapping, etc.) rather than constructing a fresh one!
+    processor = Gr00tN1d7Processor.from_pretrained(base_model_path)
+    processor.set_statistics({tag.value: stats})
+    processor.state_dropout_prob = state_dropout_prob
     collator = Gr00tN1d7DataCollator(
         model_name=cfg.model_name,
         model_type=cfg.backbone_model_type,
@@ -515,7 +500,7 @@ def main() -> None:
     p.add_argument("--embodiment-tag", default="LIBERO_PANDA")
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--codec", default="per_token_int8")
+    p.add_argument("--codec", default="bf16_raw")
     p.add_argument("--mat-batch-size", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--multi-noise", type=int, default=1)
