@@ -112,7 +112,8 @@ do_mount() {
     # Warm-cache remount (E2 "cache warm"): carry the previous generation's cache over.
     run $SUDO mv "$(cache_dir "$cur")" "$cache"
   fi
-  run $SUDO mkdir -p "$mnt" "$cache" "$B_BASE_DIR/logs"
+  run mkdir -p "$B_BASE_DIR" "$STATE_DIR" "$B_BASE_DIR/logs"
+  run $SUDO mkdir -p "$mnt" "$cache"
   local cmd="$SUDO $RCLONE_BIN mount $B_REMOTE $mnt --read-only --allow-other --uid $B_UID --gid $B_GID --vfs-cache-mode full --cache-dir $cache --vfs-cache-max-size $B_VFS_CACHE_MAX --log-file $(log_file "$gen") --log-level INFO $RCLONE_EXTRA_ARGS"
   if [ "$DRY_RUN" = "1" ]; then
     echo "+ $cmd &" >&2
