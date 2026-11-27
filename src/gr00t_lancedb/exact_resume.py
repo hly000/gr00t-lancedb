@@ -458,7 +458,8 @@ class ExactResumeMixin:
                     yield self.datasets[dataset_index].process_split_item(item)
             return
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
             in_flight: deque = deque()
 
             def enqueue() -> None:
@@ -477,6 +478,8 @@ class ExactResumeMixin:
                     if self.per_sample_seed:
                         _seed_everything(self._sample_seed(s_idx))
                     yield self.datasets[dataset_index].process_split_item(item)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
@@ -656,9 +659,11 @@ def make_exact_resume_trainer_class(base_trainer_cls: type) -> type:
         def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
             if self._matches_emergency_ckpt(resume_from_checkpoint):
                 target_model = self.model if model is None else model
-                n_loaded = _apply_trainable_weights(
-                    target_model, self._emergency_ckpt_payload["trainable_state_dict"]
-                )
+                trainable_sd = self._emergency_ckpt_payload.pop("trainable_state_dict", None)
+                if trainable_sd is None:
+                    raise RuntimeError("Emergency checkpoint missing trainable_state_dict")
+                n_loaded = _apply_trainable_weights(target_model, trainable_sd)
+                del trainable_sd
                 logger.info(
                     "Restored %d trainable parameter tensors from emergency checkpoint %s",
                     n_loaded,
@@ -669,20 +674,31 @@ def make_exact_resume_trainer_class(base_trainer_cls: type) -> type:
 
         def _load_optimizer_and_scheduler(self, checkpoint):
             if self._matches_emergency_ckpt(checkpoint):
-                opt_sd = self._emergency_ckpt_payload.get("optimizer_state_dict")
+                opt_sd = self._emergency_ckpt_payload.pop("optimizer_state_dict", None)
                 if self.optimizer is not None and opt_sd is not None:
                     self.optimizer.load_state_dict(opt_sd)
-                sched_sd = self._emergency_ckpt_payload.get("lr_scheduler_state_dict")
+                del opt_sd
+                sched_sd = self._emergency_ckpt_payload.pop("lr_scheduler_state_dict", None)
                 if self.lr_scheduler is not None and sched_sd is not None:
                     self.lr_scheduler.load_state_dict(sched_sd)
+                del sched_sd
                 logger.info("Restored optimizer & scheduler state from emergency checkpoint %s", checkpoint)
                 return
             return super()._load_optimizer_and_scheduler(checkpoint)
 
         def _load_rng_state(self, checkpoint):
             if self._matches_emergency_ckpt(checkpoint):
-                _restore_rng_state(self._emergency_ckpt_payload.get("rng_state"))
-                logger.info("Restored RNG states from emergency checkpoint %s", checkpoint)
+                rng_state = self._emergency_ckpt_payload.pop("rng_state", None)
+                _restore_rng_state(rng_state)
+                del rng_state
+                # Release the multi-GB payload immediately so it is not kept alive
+                # across forked DataLoader workers or the rest of training.
+                self._emergency_ckpt_payload = None
+                self._emergency_ckpt_dir = None
+                import gc
+
+                gc.collect()
+                logger.info("Restored RNG states from emergency checkpoint %s (payload released)", checkpoint)
                 return
             return super()._load_rng_state(checkpoint)
 
