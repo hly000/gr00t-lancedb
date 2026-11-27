@@ -235,12 +235,11 @@ class VLCacheReader:
         self.storage_options = storage_options
 
         self._table: Any = None
-        self._lance_ds: Any = None
         self.fingerprint: CacheFingerprint | None = None
         self._key_to_row: dict[tuple[int, int, int], int] | None = None
 
     def _ensure_open(self) -> None:
-        if self._lance_ds is not None:
+        if self._table is not None:
             return
         import lancedb
 
@@ -249,9 +248,8 @@ class VLCacheReader:
             kwargs["storage_options"] = self.storage_options
         db = lancedb.connect(self.db_uri, **kwargs)
         self._table = db.open_table(self.table_name)
-        self._lance_ds = self._table.to_lance()
 
-        meta = self._lance_ds.schema.metadata or {}
+        meta = self._table.schema.metadata or {}
         if CACHE_META_KEY not in meta:
             raise ValueError(
                 f"Table {self.table_name!r} in {self.db_uri!r} is missing {CACHE_META_KEY!r} metadata."
@@ -275,13 +273,13 @@ class VLCacheReader:
     @property
     def num_rows(self) -> int:
         self._ensure_open()
-        return int(self._lance_ds.count_rows())
+        return int(self._table.count_rows())
 
     def build_key_index(self) -> dict[tuple[int, int, int], int]:
         """Build an in-memory ``(episode_index, frame_index, view_id) -> physical_row_idx`` map."""
         self._ensure_open()
         if self._key_to_row is None:
-            tbl = self._lance_ds.to_table(columns=["episode_index", "frame_index", "view_id"])
+            tbl = self._table.search().select(["episode_index", "frame_index", "view_id"]).to_arrow()
             eps = tbl["episode_index"].to_numpy(zero_copy_only=False)
             frs = tbl["frame_index"].to_numpy(zero_copy_only=False)
             vws = tbl["view_id"].to_numpy(zero_copy_only=False)
@@ -290,12 +288,20 @@ class VLCacheReader:
             }
         return self._key_to_row
 
+    def take_rows_arrow(self, row_indices: Sequence[int], columns: Sequence[str] | None = None) -> pa.Table:
+        """Fetch a PyArrow table for the given physical row offsets using native LanceDB take."""
+        self._ensure_open()
+        q = self._table.take_offsets(list(row_indices))
+        if columns is not None:
+            q = q.select(list(columns))
+        return q.to_arrow()
+
     def take_rows(self, row_indices: Sequence[int]) -> list[EncodedVLRow]:
-        """Fetch a batch of rows by physical row index using Lance's O(1) random ``take()``."""
+        """Fetch a batch of rows by physical row index using Lance's O(1) random ``take_offsets()``."""
         self._ensure_open()
         assert self.fingerprint is not None
         cols = ["seq_len", "image_mask", "feat_scale", "feat_payload"]
-        pa_tbl = self._lance_ds.take(list(row_indices), columns=cols)
+        pa_tbl = self.take_rows_arrow(row_indices, columns=cols)
 
         seq_lens = pa_tbl["seq_len"].to_pylist()
         img_masks = pa_tbl["image_mask"].to_pylist()

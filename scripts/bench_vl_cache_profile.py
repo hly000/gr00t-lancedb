@@ -740,7 +740,13 @@ def cmd_train_smoke(args: argparse.Namespace) -> dict[str, Any]:
             for idx, r in enumerate(all_rows):
                 torch.save((r.feat_payload, r.feat_scale, r.image_mask), pt_dir / f"{idx:06d}.pt")
             pq_path = tmp / "cache.parquet"
-            pq.write_table(reader._lance_ds.take(list(range(n_bench))), pq_path)
+            pq.write_table(
+                reader.take_rows_arrow(
+                    list(range(n_bench)),
+                    columns=["seq_len", "image_mask", "feat_scale", "feat_payload"],
+                ),
+                pq_path,
+            )
 
             t0 = time.perf_counter()
             for b in bench_batches:
