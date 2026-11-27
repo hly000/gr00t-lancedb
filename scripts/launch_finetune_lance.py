@@ -16,12 +16,29 @@ startup phase timestamps) to ``$GR00T_BENCH_METRICS`` (default ``<output_dir>/be
 
 Key v1 performance / ablation env vars:
 - ``GR00T_LANCE_LAZY_DECODE`` (default ``1`` for ``lance``, ``0`` for ``native-exact``)
-- ``GR00T_LANCE_DECODE_BATCH_SIZE`` (default ``32``)
+- ``GR00T_LANCE_FIRST_DECODE_BATCH`` (default ``32``) / ``GR00T_LANCE_STEADY_DECODE_BATCH``
+  (default ``128``; ``GR00T_LANCE_DECODE_BATCH_SIZE`` is the legacy name for the steady size)
 - ``GR00T_LANCE_PREFETCH_BATCHES`` (default ``2``)
+- ``GR00T_LANCE_VIDEO_DECODER_CACHE`` (default ``64`` decoders per worker)
+- ``GR00T_LANCE_VIDEO_CACHE_GB`` / ``GR00T_LANCE_VIDEO_CACHE_DIR`` (GOP disk cache, object
+  stores only unless ``GR00T_LANCE_VIDEO_CACHE_FORCE=1``)
 - ``GR00T_LANCE_MP_CTX`` (default ``fork`` for ``lance`` if unopened; ``fork|forkserver|spawn``)
-- ``GR00T_LANCE_ASYNC_PREFETCH`` (default ``0``; also accepts ``GR00T_LANCE_PREFETCH_FIRST_BATCH``)
-- ``GR00T_PREEMPT_COST_GATE`` (default ``1``), ``GR00T_PREEMPT_LIGHT_CKPT`` (default ``1``),
-  ``GR00T_PREEMPT_EST_SAVE_S`` (default ``10.0`` when light ckpt else ``55.0``)
+- ``GR00T_LANCE_ASYNC_PREFETCH`` (``auto`` default: only when resuming from a checkpoint,
+  so batch 0 decodes while the checkpoint loads; ``1`` / ``0`` force)
+- ``GR00T_LANCE_BG_IMPORT`` (default ``1``: import lerobot-lancedb on a background thread
+  while GR00T loads the model; joined before the first fork)
+- ``GR00T_LANCE_AUTO_PIN`` (default ``1``: remember the frames.lance version a ``where``
+  query ran at in ``<output_dir>/lance_pins.json`` and reuse it on resume)
+- ``GR00T_SAMPLE_FINGERPRINTS`` (default ``0``: ``1`` logs one hash per sample per step)
+- ``GR00T_LANCE_IO_STATS`` (default ``1``: per-step Lance blob/GET counters, cache hits and
+  NIC bytes in ``step.io``)
+- ``GR00T_PREEMPT_*``: see ``gr00t_lancedb.exact_resume._make_preempt_callback``
+  (``GR00T_PREEMPT_CKPT_DTYPE=auto|fp32|bf16|int8``, ``GR00T_PREEMPT_DEADLINE_S`` ...)
+
+Startup segments (``startup_summary``): ``imports_s`` -> ``model_load_s`` (config, model and
+processor until the dataset build starts) -> ``dataset_build_s`` -> ``trainer_init_s`` ->
+``ckpt_load_s`` (weights + optimizer + RNG on resume) -> ``dataloader_create_s`` ->
+``first_batch_wait_s`` -> ``first_step_s``.
 
 Usage::
 
@@ -138,6 +155,67 @@ def _memory_mb(full: bool) -> dict[str, float]:
     return out
 
 
+def _net_rx_bytes() -> int | None:
+    """Bytes received on all non-loopback interfaces (Linux ``/proc/net/dev``)."""
+    try:
+        with open("/proc/net/dev", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()[2:]
+    except OSError:
+        return None
+    total = 0
+    for line in lines:
+        name, _, rest = line.partition(":")
+        if name.strip() == "lo" or not rest.split():
+            continue
+        total += int(rest.split()[0])
+    return total
+
+
+def _sample_fingerprints(batch) -> list[str]:
+    """One short hash per sample of a collated batch (strided, <=4096 values per tensor).
+
+    The batch size is the most common leading dimension; every tensor with that leading
+    dimension contributes its row. Raw bytes are hashed (bf16 viewed as int16), so equal
+    samples give equal hashes regardless of float formatting.
+    """
+    import hashlib
+    from collections import Counter
+
+    import torch
+
+    tensors: list[tuple[str, torch.Tensor]] = []
+
+    def walk(obj, key: str) -> None:
+        if isinstance(obj, torch.Tensor):
+            if obj.ndim >= 1:
+                tensors.append((key, obj))
+        elif hasattr(obj, "items"):
+            for k in sorted(obj.keys(), key=str):
+                walk(obj[k], f"{key}.{k}")
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                walk(v, f"{key}[{i}]")
+
+    walk(batch, "")
+    if not tensors:
+        return []
+    bsz = Counter(int(t.shape[0]) for _, t in tensors).most_common(1)[0][0]
+    hashers = [hashlib.blake2b(digest_size=8) for _ in range(bsz)]
+    for key, t in tensors:
+        if int(t.shape[0]) != bsz:
+            continue
+        flat = t.detach().reshape(bsz, -1)
+        stride = max(1, flat.shape[1] // 4096)
+        sel = flat[:, ::stride].contiguous()
+        if sel.dtype == torch.bfloat16:
+            sel = sel.view(torch.int16)
+        rows = sel.cpu().numpy()
+        for i in range(bsz):
+            hashers[i].update(key.encode())
+            hashers[i].update(rows[i].tobytes())
+    return [h.hexdigest() for h in hashers]
+
+
 def _batch_fingerprint(batch) -> str:
     """Short hash of every tensor in a collated batch (strided sample, <=4096 values each).
 
@@ -167,6 +245,29 @@ def _batch_fingerprint(batch) -> str:
     return h.hexdigest()
 
 
+_STARTUP_KEYS = (
+    "imports_s",
+    "model_load_s",
+    "dataset_build_s",
+    "trainer_init_s",
+    "ckpt_load_s",
+    "ckpt_weights_s",
+    "ckpt_optim_s",
+    "ckpt_rng_s",
+    "dataloader_create_s",
+    "lance_preload_s",
+    "lance_isolated_s",
+    "lance_isolated_calls",
+    "lance_where_cache_hit",
+    "lance_frames_version",
+    "mp_ctx",
+    "lazy_decode",
+    "async_prefetch",
+    "resuming",
+    "decode_batch",
+)
+
+
 def make_bench_callback(
     metrics_path: Path,
     launch_t0: float,
@@ -191,6 +292,7 @@ def make_bench_callback(
             self._first_batch_recorded = False
             self._first_step_recorded = False
             self.peak = {"sys_used_mb": 0.0, "pss_tree_mb": 0.0, "main_rss_mb": 0.0}
+            self.rx0 = _net_rx_bytes()
 
         def _write(self, rec: dict) -> None:
             if self.fh is None:
@@ -208,7 +310,7 @@ def make_bench_callback(
                 "global_step": int(state.global_step),
                 "backend": os.environ.get("GR00T_DATA_BACKEND", "native"),
             }
-            for k in ("imports_s", "dataset_build_s", "trainer_init_s", "dataloader_create_s", "mp_ctx"):
+            for k in _STARTUP_KEYS:
                 if k in phases:
                     rec[k] = phases[k]
             if os.environ.get("GR00T_LANCE_WHERE"):
@@ -240,6 +342,22 @@ def make_bench_callback(
                         }
                     )
 
+        def _io_snapshot(self) -> dict[str, Any] | None:
+            stats_dir = os.environ.get("GR00T_LANCE_IO_STATS_DIR")
+            if not stats_dir:
+                return None
+            try:
+                from gr00t_lancedb.gop_cache import IO_STATS, aggregate_io_stats
+
+                IO_STATS.maybe_flush(force=True)  # num_workers=0: the main process reads too
+                io = aggregate_io_stats(stats_dir)
+            except Exception:  # noqa: BLE001 - metrics must never kill training
+                return None
+            rx = _net_rx_bytes()
+            if rx is not None and self.rx0 is not None:
+                io["net_rx_bytes"] = rx - self.rx0
+            return io
+
         def on_step_end(self, args, state, control, **kwargs):
             # Capture step completion timestamp BEFORE expensive _memory_mb() / disk flush!
             now = time.time()
@@ -267,6 +385,11 @@ def make_bench_callback(
                 rec["step_loss"] = loss_box.pop("loss")
             if "fp" in loss_box:
                 rec["batch_fp"] = loss_box.pop("fp")
+            if "sample_fps" in loss_box:
+                rec["sample_fps"] = loss_box.pop("sample_fps")
+            io = self._io_snapshot()
+            if io is not None:
+                rec["io"] = io
             self._write(rec)
 
             if not self._first_step_recorded:
@@ -280,15 +403,7 @@ def make_bench_callback(
                     "first_batch_wait_s": phases.get("first_batch_wait_s", self.data_wait),
                     "first_step_s": step_s,
                 }
-                for k in (
-                    "imports_s",
-                    "dataset_build_s",
-                    "trainer_init_s",
-                    "dataloader_create_s",
-                    "mp_ctx",
-                    "lazy_decode",
-                    "async_prefetch",
-                ):
+                for k in _STARTUP_KEYS:
                     if k in phases:
                         summary[k] = phases[k]
                 self._write(summary)
@@ -382,7 +497,7 @@ def resolve_lance_mp_context(train_dataset: Any, requested: str | None = None) -
     if req == "fork":
         raise RuntimeError(f"GR00T_LANCE_MP_CTX=fork requested, but dataset is not unopened: {err}")
 
-    from lerobot_lancedb import lance_mp_context
+    from gr00t_lancedb._isolated import lance_mp_context
 
     fallback = lance_mp_context()
     logger.warning(
@@ -463,6 +578,31 @@ def make_prewarmed_dataloader(base_dl):
 
 _URI_SCHEMES = ("s3", "gs", "gcs", "az", "abfs", "hf", "file", "http", "https")
 
+# Shared between main() and the DatasetFactory.build patch.
+_RUN: dict[str, Any] = {"phases": {}, "output_dir": None}
+LANCE_PINS_FILENAME = "lance_pins.json"
+
+
+def _load_lance_pins(output_dir: Path | None) -> dict[str, int]:
+    if output_dir is None:
+        return {}
+    try:
+        return {k: int(v) for k, v in json.loads((output_dir / LANCE_PINS_FILENAME).read_text()).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _save_lance_pins(output_dir: Path | None, pins: dict[str, int]) -> None:
+    if output_dir is None or not pins:
+        return
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tmp = output_dir / f".{LANCE_PINS_FILENAME}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(pins, indent=2, sort_keys=True))
+        os.replace(tmp, output_dir / LANCE_PINS_FILENAME)
+    except OSError:
+        pass
+
 
 def _rejoin_uris(paths: list) -> list:
     """Undo ``launch_finetune.py``'s ``split(os.pathsep)`` on URIs: ["s3", "//b/k"] -> ["s3://b/k"]."""
@@ -504,6 +644,13 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
     lance_where = os.environ.get("GR00T_LANCE_WHERE") or None
     lance_version_raw = os.environ.get("GR00T_LANCE_VERSION")
     lance_version = int(lance_version_raw) if lance_version_raw else None
+    decoder_cache = int(os.environ.get("GR00T_LANCE_VIDEO_DECODER_CACHE", "64"))
+    # MVCC auto-pin: a resumed run reads the exact frames.lance snapshot (anchors, rows and
+    # q01/q99) its first launch trained on, even if the table was curated in between.
+    auto_pin = os.environ.get("GR00T_LANCE_AUTO_PIN", "1") == "1"
+    pins = _load_lance_pins(_RUN["output_dir"]) if (auto_pin and backend == "lance") else {}
+    new_pins: dict[str, int] = {}
+    lance_stats = {"isolated_s": 0.0, "isolated_calls": 0, "where_cache_hit": None, "versions": {}}
 
     all_datasets, all_weights = [], []
     for spec in cfg.data.datasets:
@@ -522,11 +669,23 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
             if backend == "lance":
                 # Stats were baked into meta.lance at conversion time: no rank-0 parquet scan.
                 lance_kw = dict(common)
+                lance_kw["video_decoder_cache_size"] = decoder_cache
                 if lance_where is not None:
                     lance_kw["where"] = lance_where
-                if lance_version is not None:
-                    lance_kw["lance_version"] = lance_version
-                group.append(LanceShardedSingleStepDataset(**lance_kw))
+                version = lance_version if lance_version is not None else pins.get(str(path))
+                if version is not None:
+                    lance_kw["lance_version"] = version
+                ds = LanceShardedSingleStepDataset(**lance_kw)
+                info = ds.episode_loader.startup_info
+                lance_stats["isolated_s"] += float(info.get("isolated_wall_s", 0.0))
+                lance_stats["isolated_calls"] += int(info.get("isolated_calls", 0))
+                if "where_cache_hit" in info:
+                    lance_stats["where_cache_hit"] = bool(info["where_cache_hit"])
+                if ds.frames_version is not None:
+                    lance_stats["versions"][str(path)] = int(ds.frames_version)
+                    if lance_where is not None or version is not None:
+                        new_pins[str(path)] = int(ds.frames_version)
+                group.append(ds)
             else:
                 with run_or_wait_on_rank0(label=f"generate_stats({path})") as is_rank0:
                     if is_rank0:
@@ -543,10 +702,24 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
         ds_lengths = np.array([len(d) for d in all_datasets], dtype=np.float64)
         all_weights = (np.power(ds_lengths, alpha) / np.power(ds_lengths[0], alpha)).tolist()
 
+    if backend == "lance":
+        phases = _RUN["phases"]
+        phases["lance_isolated_s"] = round(lance_stats["isolated_s"], 3)
+        phases["lance_isolated_calls"] = lance_stats["isolated_calls"]
+        if lance_stats["where_cache_hit"] is not None:
+            phases["lance_where_cache_hit"] = lance_stats["where_cache_hit"]
+        if lance_stats["versions"]:
+            phases["lance_frames_version"] = lance_stats["versions"]
+        if auto_pin and new_pins:
+            _save_lance_pins(_RUN["output_dir"], {**pins, **new_pins})
+
     default_lazy = "1" if backend == "lance" else "0"
     lazy_decode = os.environ.get("GR00T_LANCE_LAZY_DECODE", default_lazy) == "1"
-    decode_batch_size = int(os.environ.get("GR00T_LANCE_DECODE_BATCH_SIZE", "32"))
+    steady_default = os.environ.get("GR00T_LANCE_DECODE_BATCH_SIZE", "128")
+    decode_batch_size = int(os.environ.get("GR00T_LANCE_STEADY_DECODE_BATCH", steady_default))
+    first_decode_batch = int(os.environ.get("GR00T_LANCE_FIRST_DECODE_BATCH", "32"))
     prefetch_batches = int(os.environ.get("GR00T_LANCE_PREFETCH_BATCHES", "2"))
+    _RUN["phases"]["decode_batch"] = [first_decode_batch, decode_batch_size]
 
     mixture_cls = make_exact_resume_mixture_class(FastShardedMixtureDataset)
     mix = mixture_cls(
@@ -563,6 +736,7 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
         per_sample_seed=os.environ.get("GR00T_PER_SAMPLE_SEED", "1") == "1",
         lazy_decode=lazy_decode,
         decode_batch_size=decode_batch_size,
+        first_decode_batch_size=first_decode_batch,
         prefetch_batches=prefetch_batches,
     )
     return mix, None
@@ -637,8 +811,15 @@ def main() -> None:
                 exp = gr00t_args[i + 1]
         return Path(out) / exp if exp else Path(out)
 
-    metrics_path = Path(os.environ.get("GR00T_BENCH_METRICS", str(_output_dir_from_args() / "bench_metrics.jsonl")))
-    phase_box: dict[str, Any] = {}
+    run_output_dir = _output_dir_from_args()
+    metrics_path = Path(os.environ.get("GR00T_BENCH_METRICS", str(run_output_dir / "bench_metrics.jsonl")))
+    phase_box: dict[str, Any] = _RUN["phases"]
+    _RUN["output_dir"] = run_output_dir
+    if backend == "lance" and os.environ.get("GR00T_LANCE_IO_STATS", "1") == "1":
+        # Workers inherit the env and flush per-process Lance blob / cache counters here.
+        os.environ.setdefault(
+            "GR00T_LANCE_IO_STATS_DIR", str(run_output_dir / "io_stats" / f"run-{int(launch_t0)}-{os.getpid()}")
+        )
 
     t_imp0 = time.time()
     import gr00t.experiment.experiment as gexp
@@ -646,6 +827,12 @@ def main() -> None:
 
     t_imp1 = time.time()
     phase_box["imports_s"] = t_imp1 - t_imp0
+    if backend == "lance" and os.environ.get("GR00T_LANCE_BG_IMPORT", "1") == "1":
+        # Overlap the lerobot-lancedb import (~2-3 s) with GR00T's model loading. Forked
+        # workers inherit it; a pre-fork hook joins the thread so no fork happens mid-import.
+        import gr00t_lancedb
+
+        gr00t_lancedb.preload_lance_stack(background=True)
     _append_metric_line(
         metrics_path,
         {
@@ -673,6 +860,7 @@ def main() -> None:
 
     def _timed_build(self, processor):
         t0 = time.time()
+        phase_box["model_load_s"] = t0 - t_imp1
         if isinstance(inner_build, type(orig_build)) or callable(inner_build):
             res = inner_build(self, processor)
         else:
@@ -696,13 +884,15 @@ def main() -> None:
 
     gfactory.DatasetFactory.build = _timed_build
 
-    async_prefetch = (
-        os.environ.get("GR00T_LANCE_ASYNC_PREFETCH", "0") == "1"
-        or os.environ.get("GR00T_LANCE_PREFETCH_FIRST_BATCH", "0") == "1"
-    )
-    phase_box["async_prefetch"] = async_prefetch
+    prefetch_setting = os.environ.get("GR00T_LANCE_ASYNC_PREFETCH")
+    if prefetch_setting is None and os.environ.get("GR00T_LANCE_PREFETCH_FIRST_BATCH") == "1":
+        prefetch_setting = "1"
+    prefetch_setting = (prefetch_setting or "auto").strip().lower()
+    if prefetch_setting not in ("auto", "1", "0"):
+        raise ValueError(f"GR00T_LANCE_ASYNC_PREFETCH must be auto|1|0, got {prefetch_setting!r}")
 
     trainer_cls = base_trainer
+    sample_fps_on = os.environ.get("GR00T_SAMPLE_FINGERPRINTS", "0") == "1"
 
     class BenchTrainer(trainer_cls):  # type: ignore[misc, valid-type]
         def __init__(self, *a, **kw):
@@ -715,6 +905,12 @@ def main() -> None:
             else:
                 phase_box["mp_ctx"] = kw.get("multiprocessing_context", "fork")
             super().__init__(*a, **kw)
+            if backend == "lance":
+                import gr00t_lancedb
+
+                wall = gr00t_lancedb.join_preload(timeout=0)
+                if wall is not None:
+                    phase_box["lance_preload_s"] = round(wall, 3)
             self._bench_loss: dict = {}
             self._prewarmed_dl = None
             self.add_callback(make_bench_callback(metrics_path, launch_t0, self._bench_loss, phase_box))
@@ -735,18 +931,42 @@ def main() -> None:
         def _build_base_dataloader(self):
             return super().get_train_dataloader()
 
+        def _timed_ckpt(self, key: str, fn, *a, **kw):
+            t0 = time.time()
+            try:
+                return fn(*a, **kw)
+            finally:
+                dt = time.time() - t0
+                phase_box[key] = phase_box.get(key, 0.0) + dt
+                phase_box["ckpt_load_s"] = phase_box.get("ckpt_load_s", 0.0) + dt
+
+        def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+            return self._timed_ckpt(
+                "ckpt_weights_s", super()._load_from_checkpoint, resume_from_checkpoint, model=model
+            )
+
+        def _load_optimizer_and_scheduler(self, checkpoint):
+            return self._timed_ckpt("ckpt_optim_s", super()._load_optimizer_and_scheduler, checkpoint)
+
+        def _load_rng_state(self, checkpoint):
+            return self._timed_ckpt("ckpt_rng_s", super()._load_rng_state, checkpoint)
+
         def train(self, resume_from_checkpoint=None, **kwargs):
-            # Optional async prefetch: build & start DataLoader iterator before HF Trainer
-            # loads checkpoint weights and sets up model/optimizer/scheduler.
+            # Resolve the checkpoint first: async prefetch only pays off while a checkpoint
+            # (10-24 GB) loads; on a fresh run train() reaches the first batch immediately.
             self._prewarmed_dl = None
+            ckpt = resume_from_checkpoint
+            if ckpt is True:
+                from transformers.trainer_utils import get_last_checkpoint
+
+                ckpt = get_last_checkpoint(self.args.output_dir)
+            resuming = isinstance(ckpt, (str, Path)) and Path(ckpt).is_dir()
+            phase_box["resuming"] = bool(resuming)
+            async_prefetch = prefetch_setting == "1" or (prefetch_setting == "auto" and resuming)
+            phase_box["async_prefetch"] = bool(async_prefetch)
             if async_prefetch and hasattr(self.train_dataset, "set_resume_point"):
                 # Peek resume global_step so set_resume_point is exact before starting workers.
-                ckpt = resume_from_checkpoint
-                if ckpt is True:
-                    from transformers.trainer_utils import get_last_checkpoint
-
-                    ckpt = get_last_checkpoint(self.args.output_dir)
-                if isinstance(ckpt, (str, Path)):
+                if resuming:
                     state_file = Path(ckpt) / "trainer_state.json"
                     if state_file.is_file():
                         from transformers import TrainerState
@@ -807,6 +1027,8 @@ def main() -> None:
             if model.training:
                 self._bench_loss["loss"] = float(loss.detach().float().item())
                 self._bench_loss["fp"] = _batch_fingerprint(inputs)
+                if sample_fps_on:
+                    self._bench_loss["sample_fps"] = _sample_fingerprints(inputs)
             return out
 
         def save_model(self, output_dir=None, _internal_call=False):
@@ -824,7 +1046,7 @@ def main() -> None:
         "backend=%s mp_ctx=%s async_prefetch=%s metrics=%s argv=%s",
         backend,
         requested_mp_ctx or ("fork(auto)" if backend == "lance" else "default"),
-        async_prefetch,
+        prefetch_setting,
         metrics_path,
         sys.argv,
     )

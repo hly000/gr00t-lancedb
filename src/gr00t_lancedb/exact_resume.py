@@ -296,16 +296,26 @@ class ExactResumeMixin:
         lazy_decode: bool = False,
         decode_batch_size: int = 32,
         prefetch_batches: int = 2,
+        first_decode_batch_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         if decode_batch_size < 1:
             raise ValueError(f"decode_batch_size must be >= 1, got {decode_batch_size}")
+        if first_decode_batch_size is not None and first_decode_batch_size < 1:
+            raise ValueError(f"first_decode_batch_size must be >= 1, got {first_decode_batch_size}")
         if prefetch_batches < 0:
             raise ValueError(f"prefetch_batches must be >= 0, got {prefetch_batches}")
         self.per_sample_seed = bool(per_sample_seed)
         self.lazy_decode = bool(lazy_decode)
+        # Steady-state chunk size (more anchors per Lance take / blob fetch) and a smaller
+        # first chunk after every (re)start so the first batch is not delayed. Chunking only
+        # groups decode calls: anchors are drawn in the same RNG order either way, so the
+        # sample stream is bit-identical for any sizes.
         self.decode_batch_size = int(decode_batch_size)
+        self.first_decode_batch_size = (
+            int(first_decode_batch_size) if first_decode_batch_size is not None else self.decode_batch_size
+        )
         self.prefetch_batches = int(prefetch_batches)
         self.resume_batches = 0
         self.loader_batch_size: int | None = None
@@ -328,6 +338,7 @@ class ExactResumeMixin:
             "per_sample_seed": self.per_sample_seed,
             "lazy_decode": self.lazy_decode,
             "decode_batch_size": self.decode_batch_size,
+            "first_decode_batch_size": self.first_decode_batch_size,
             "prefetch_batches": self.prefetch_batches,
         }
 
@@ -424,9 +435,14 @@ class ExactResumeMixin:
                 self.rank, self.worker_id, skip,
             )
 
+        n_chunks = 0
+
         def next_chunk() -> list[tuple[int, int, int, int]]:
+            nonlocal n_chunks
+            size = self.first_decode_batch_size if n_chunks == 0 else self.decode_batch_size
+            n_chunks += 1
             chunk_meta: list[tuple[int, int, int, int]] = []
-            for _ in range(self.decode_batch_size):
+            for _ in range(size):
                 s_idx = served
                 ds_idx, ep_idx, step_idx = draw_one()
                 chunk_meta.append((s_idx, ds_idx, ep_idx, step_idx))

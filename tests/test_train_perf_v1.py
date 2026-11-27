@@ -775,3 +775,24 @@ def test_prewarmed_dataloader_yields_exact_stream_in_hf_trainer(tmp_path: Path) 
     )
     trainer.train()
     assert trainer.state.global_step == 4
+
+
+@pytest.mark.parametrize("nw", [0, 2])
+@pytest.mark.parametrize("first,steady", [(3, 17), (7, 7), (1, 64)])
+def test_tiered_decode_chunks_keep_exact_stream(nw: int, first: int, steady: int) -> None:
+    """Plan 2.1: small first chunk + large steady chunks change grouping only, not order."""
+    ref = _stream(_ExactFake(_datasets(), lazy_decode=False), 40, 5, nw)
+    tiered = _stream(
+        _ExactFake(
+            _datasets(), lazy_decode=True, first_decode_batch_size=first,
+            decode_batch_size=steady, prefetch_batches=2,
+        ),
+        40, 5, nw,
+    )
+    assert tiered == ref
+    resumed_ds = _ExactFake(
+        _datasets(), lazy_decode=True, first_decode_batch_size=first, decode_batch_size=steady,
+        prefetch_batches=2,
+    )
+    resumed_ds.set_resume_point(13, 5)
+    assert _stream(resumed_ds, 27, 5, nw) == ref[13:]
