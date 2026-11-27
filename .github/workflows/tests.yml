@@ -30,7 +30,8 @@ jobs:
             "git+https://github.com/lancedb/lerobot-lancedb.git#egg=lerobot-lancedb[s3]" \
             "lerobot[dataset]>=0.7.0" \
             "lancedb>=0.42.0b26" \
-            torchcodec boto3 pandas pytest "moto[server]"
+            torchcodec boto3 pandas pytest "moto[server]" av \
+            transformers accelerate psutil
           uv pip install --python .venv/bin/python --no-deps -e .
 
       - name: Run parity, S3 streaming, and Spot preemption tests
