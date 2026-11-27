@@ -61,6 +61,17 @@ _LAZY: dict[str, str] = {
     # I/O stats & GOP cache
     "GopDiskCache": ".gop_cache",
     "aggregate_io_stats": ".gop_cache",
+    # vector curation (embeddings / IVF-PQ / semantic dedup / hybrid search; offline tool)
+    "EMBEDDING_COLUMN": ".vector_curate",
+    "SEMANTIC_DUP_COLUMNS": ".vector_curate",
+    "KinematicEmbeddingProvider": ".vector_curate",
+    "VisualEmbeddingProvider": ".vector_curate",
+    "add_embedding_column": ".vector_curate",
+    "build_vector_index": ".vector_curate",
+    "tag_semantic_duplicates": ".vector_curate",
+    "hybrid_search": ".vector_curate",
+    "slice_episodes_by_similarity": ".vector_curate",
+    "mine_rare_frames": ".vector_curate",
 }
 
 __all__ = sorted([*_LAZY, "__version__", "preload_lance_stack", "join_preload"])
@@ -161,6 +172,18 @@ if TYPE_CHECKING:  # pragma: no cover - static typing only
     )
     from .resumable_mixture import ResumableLanceMixtureDataset
     from .sharded_dataset import LanceShardedSingleStepDataset
+    from .vector_curate import (
+        EMBEDDING_COLUMN,
+        SEMANTIC_DUP_COLUMNS,
+        KinematicEmbeddingProvider,
+        VisualEmbeddingProvider,
+        add_embedding_column,
+        build_vector_index,
+        hybrid_search,
+        mine_rare_frames,
+        slice_episodes_by_similarity,
+        tag_semantic_duplicates,
+    )
     from .trainer_integration import (
         SpotPreemptionMonitor,
         build_lance_mixture_dataset,

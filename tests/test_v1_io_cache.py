@@ -244,3 +244,29 @@ def test_summarize_io_and_startup_segments() -> None:
     assert out["io.lance_mb_per_step"] == 1.0
     assert out["io.gop_cache_hit_rate"] == 0.75
     assert out["io.est_get_usd_per_1k_steps"] == pytest.approx(5 * 0.0004)
+
+
+def test_bench_callback_logs_emergency_save_once(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    launch = _load_script("launch_finetune_lance")
+    metrics = tmp_path / "bench_metrics.jsonl"
+    cb = launch.make_bench_callback(metrics, 0.0, {}, {}, start_gpu_sampler=False)
+    cb.preempt_cb = SimpleNamespace(last_decision=None, saved_light_ckpt=None)
+    args, control = SimpleNamespace(), SimpleNamespace(should_save=False)
+    state = SimpleNamespace(global_step=0)
+    cb.on_train_begin(args, state, control)
+    for gs in (1, 2):
+        state.global_step = gs
+        cb.on_step_begin(args, state, control)
+        cb.on_step_end(args, state, control)
+    cb.preempt_cb.last_decision = {"action": "save", "dtype": "bf16", "est_save_s": 12.0}
+    cb.preempt_cb.saved_light_ckpt = tmp_path / "checkpoint-3"
+    for gs in (3, 3):  # a second callback round must not duplicate the record
+        state.global_step = gs
+        cb.on_step_begin(args, state, control)
+        cb.on_step_end(args, state, control)
+    recs = [json.loads(ln) for ln in metrics.read_text().splitlines()]
+    saves = [r for r in recs if r["event"] == "save"]
+    assert len(saves) == 1 and saves[0]["emergency"] is True and saves[0]["global_step"] == 3
+    assert saves[0]["decision"]["dtype"] == "bf16" and saves[0]["checkpoint"].endswith("checkpoint-3")

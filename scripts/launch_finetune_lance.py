@@ -293,6 +293,9 @@ def make_bench_callback(
             self._first_step_recorded = False
             self.peak = {"sys_used_mb": 0.0, "pss_tree_mb": 0.0, "main_rss_mb": 0.0}
             self.rx0 = _net_rx_bytes()
+            # Set by BenchTrainer: the exact-resume preemption callback (runs before us).
+            self.preempt_cb = None
+            self._logged_decision = None
 
         def _write(self, rec: dict) -> None:
             if self.fh is None:
@@ -391,6 +394,25 @@ def make_bench_callback(
             if io is not None:
                 rec["io"] = io
             self._write(rec)
+            decision = getattr(self.preempt_cb, "last_decision", None)
+            if decision is not None and decision is not self._logged_decision:
+                self._logged_decision = decision
+                saved = getattr(self.preempt_cb, "saved_light_ckpt", None)
+                self._write(
+                    {
+                        # "save" only once the light checkpoint is durably on disk; a full HF
+                        # save requested here is logged by on_save when it completes.
+                        "event": "save" if saved is not None else (
+                            "preempt_skip" if decision.get("action") == "skip" else "preempt_decision"
+                        ),
+                        "emergency": True,
+                        "global_step": int(state.global_step),
+                        "t": time.time(),
+                        "since_launch_s": time.time() - launch_t0,
+                        "checkpoint": str(saved) if saved is not None else None,
+                        "decision": decision,
+                    }
+                )
 
             if not self._first_step_recorded:
                 self._first_step_recorded = True
@@ -913,7 +935,11 @@ def main() -> None:
                     phase_box["lance_preload_s"] = round(wall, 3)
             self._bench_loss: dict = {}
             self._prewarmed_dl = None
-            self.add_callback(make_bench_callback(metrics_path, launch_t0, self._bench_loss, phase_box))
+            bench_cb = make_bench_callback(metrics_path, launch_t0, self._bench_loss, phase_box)
+            bench_cb.preempt_cb = next(
+                (c for c in self.callback_handler.callbacks if hasattr(c, "last_decision")), None
+            )
+            self.add_callback(bench_cb)
             t_init1 = time.time()
             phase_box["trainer_init_s"] = t_init1 - t_init0
             _append_metric_line(
