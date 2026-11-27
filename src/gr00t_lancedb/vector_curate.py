@@ -497,15 +497,64 @@ class KinematicEmbeddingProvider:
         }
 
     @staticmethod
-    def _zscore(x: np.ndarray) -> np.ndarray:
+    def zscore_params(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-dimension ``(mean, std)`` over finite rows, as used by ``__call__``."""
+        x = np.asarray(x, dtype=np.float64)
         if x.shape[1] == 0:
-            return x
+            return np.zeros(0), np.ones(0)
         finite_rows = np.all(np.isfinite(x), axis=1)
         ref = x[finite_rows] if np.any(finite_rows) else np.zeros((1, x.shape[1]))
         mu = ref.mean(axis=0)
         sd = ref.std(axis=0)
         sd = np.where(sd > 1e-8, sd, 1.0)
+        return mu, sd
+
+    @classmethod
+    def _zscore(cls, x: np.ndarray) -> np.ndarray:
+        if x.shape[1] == 0:
+            return x
+        mu, sd = cls.zscore_params(x)
         return (x - mu) / sd
+
+    def _finish(self, parts: list[np.ndarray]) -> np.ndarray:
+        feat = np.concatenate(parts, axis=1)
+        if self.dim is not None and 0 < int(self.dim) < feat.shape[1]:
+            rng = np.random.default_rng(self.seed)
+            proj = rng.standard_normal((feat.shape[1], int(self.dim))) / math.sqrt(int(self.dim))
+            bad = ~np.all(np.isfinite(feat), axis=1)
+            feat = _matmul(np.where(bad[:, None], 0.0, feat), proj)
+            feat[bad] = np.nan
+        out, ok = _l2_normalize(feat.astype(np.float32))
+        out[~ok] = np.nan
+        return out
+
+    def embed_windows(
+        self,
+        state: np.ndarray,
+        action_window: np.ndarray,
+        *,
+        state_ref: tuple[np.ndarray, np.ndarray],
+        action_ref: tuple[np.ndarray, np.ndarray],
+    ) -> np.ndarray:
+        """Embed frames that are not rows of the table (e.g. simulator rollouts).
+
+        ``state`` is ``(R, Ds)`` and ``action_window`` is ``(R, horizon, Da)`` (already padded);
+        ``state_ref`` / ``action_ref`` are the table's :meth:`zscore_params`, so the result is in
+        the same space as the stored embedding column.
+        """
+        state = np.asarray(state, dtype=np.float64)
+        action_window = np.asarray(action_window, dtype=np.float64)
+        if action_window.ndim != 3 or action_window.shape[1] != self.horizon:
+            raise ValueError(f"action_window must be (R, {self.horizon}, Da), got {action_window.shape}")
+        r = len(state)
+        parts = []
+        if state.shape[1]:
+            parts.append(self.state_weight * (state - state_ref[0]) / state_ref[1])
+        if action_window.shape[2]:
+            za = (action_window - action_ref[0]) / action_ref[1]
+            parts.append(self.action_weight * za.reshape(r, -1) / math.sqrt(self.horizon))
+        parts.append(np.ones((r, 1), dtype=np.float64))
+        return self._finish(parts)
 
     def __call__(self, batch: FrameBatch) -> np.ndarray:
         if self.horizon < 1:
@@ -537,17 +586,7 @@ class KinematicEmbeddingProvider:
             chunk = za[chunk_rows].reshape(len(rows), -1)
             parts.append(self.action_weight * chunk / math.sqrt(self.horizon))
         parts.append(np.ones((len(rows), 1), dtype=np.float64))
-        feat = np.concatenate(parts, axis=1)
-
-        if self.dim is not None and 0 < int(self.dim) < feat.shape[1]:
-            rng = np.random.default_rng(self.seed)
-            proj = rng.standard_normal((feat.shape[1], int(self.dim))) / math.sqrt(int(self.dim))
-            bad = ~np.all(np.isfinite(feat), axis=1)
-            feat = _matmul(np.where(bad[:, None], 0.0, feat), proj)
-            feat[bad] = np.nan
-        out, ok = _l2_normalize(feat.astype(np.float32))
-        out[~ok] = np.nan
-        return out
+        return self._finish(parts)
 
 
 def load_hf_image_encoder(model_path: str | Path, *, device: str = "cpu") -> Callable[[list[np.ndarray]], np.ndarray]:

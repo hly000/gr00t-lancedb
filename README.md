@@ -110,6 +110,20 @@ gr00t-spot-bench inject --poisson-mean-s 600 --signal SIGTERM --gpu-hourly-usd 1
   torchrun --nproc_per_node=1 examples/finetune_gr00t_lance.py ...
 ```
 
+### Model-in-the-loop data flywheel (fast validation)
+
+Mine failed LIBERO rollouts of a checkpoint, write a per-frame sampling weight column to
+`frames.lance` (zero-copy, `videos.lance` untouched), and fork round 2 from the baseline's
+checkpoint with weighted, exactly-resumable sampling:
+
+```bash
+STAGE=g0 | curve | mine | g3 | final  DATASET=... RUNS=... bash scripts/flywheel/fast_validation.sh
+gr00t-lance-flywheel mine --lance-root ./libero_10_lance --rollouts runs/g0/eval_14000
+gr00t-lance-flywheel compare --baseline runs/g0/eval_20000 --candidate runs/g3/eval_20000
+```
+
+See [docs/flywheel-fast-validation.md](docs/flywheel-fast-validation.md).
+
 ## License
 
 Apache-2.0

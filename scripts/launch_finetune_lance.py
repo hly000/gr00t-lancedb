@@ -32,6 +32,13 @@ Key v1 performance / ablation env vars:
 - ``GR00T_SAMPLE_FINGERPRINTS`` (default ``0``: ``1`` logs one hash per sample per step)
 - ``GR00T_LANCE_IO_STATS`` (default ``1``: per-step Lance blob/GET counters, cache hits and
   NIC bytes in ``step.io``)
+- ``GR00T_LANCE_WEIGHT_COLUMN`` (flywheel round 2: draw anchors i.i.d. with probability
+  proportional to this ``frames.lance`` column, e.g. ``flywheel_weight``; requires ``lance``).
+  ``GR00T_LANCE_WEIGHT_VERSION`` pins the frames.lance version the column is read at and
+  ``GR00T_LANCE_WEIGHT_DEFAULT`` (default ``1.0``) fills anchors with no value
+- ``GR00T_KEEP_CKPT_STEPS`` / ``GR00T_KEEP_CKPT_WEIGHTS_ONLY`` (comma-separated steps: hard-link
+  those checkpoints into ``<output_dir>/keep/`` so ``save_total_limit`` rotation cannot delete
+  them; the weights-only ones drop optimizer / scheduler / RNG files)
 - ``GR00T_PREEMPT_*``: see ``gr00t_lancedb.exact_resume._make_preempt_callback``
   (``GR00T_PREEMPT_CKPT_DTYPE=auto|fp32|bf16|int8``, ``GR00T_PREEMPT_DEADLINE_S`` ...)
 
@@ -754,6 +761,17 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
     prefetch_batches = int(os.environ.get("GR00T_LANCE_PREFETCH_BATCHES", "2"))
     _RUN["phases"]["decode_batch"] = [first_decode_batch, decode_batch_size]
 
+    weighted = None
+    weight_column = os.environ.get("GR00T_LANCE_WEIGHT_COLUMN") or None
+    if weight_column is not None:
+        if backend != "lance":
+            raise ValueError("GR00T_LANCE_WEIGHT_COLUMN requires GR00T_DATA_BACKEND=lance")
+        weighted = _load_weighted_anchors(all_datasets, all_weights, weight_column)
+        _RUN["phases"]["weighted_anchors"] = weighted.summary()
+        if not lazy_decode:
+            logger.info("GR00T_LANCE_WEIGHT_COLUMN set: forcing lazy decode for weighted sampling")
+            lazy_decode = True
+
     mixture_cls = make_exact_resume_mixture_class(FastShardedMixtureDataset)
     mix = mixture_cls(
         datasets=all_datasets,
@@ -771,8 +789,60 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
         decode_batch_size=decode_batch_size,
         first_decode_batch_size=first_decode_batch,
         prefetch_batches=prefetch_batches,
+        weighted_anchors=weighted,
     )
     return mix, None
+
+
+def _load_weighted_anchors(datasets: list, mix_weights: list[float], column: str):
+    """Read ``column`` for every Lance dataset (isolated child) and build the sampling CDF."""
+    from gr00t_lancedb._isolated import run_isolated
+    from gr00t_lancedb.flywheel.weights import (
+        build_weighted_anchors,
+        dataset_episode_anchors,
+        map_frame_weights,
+    )
+
+    version_raw = os.environ.get("GR00T_LANCE_WEIGHT_VERSION")
+    default = float(os.environ.get("GR00T_LANCE_WEIGHT_DEFAULT", "1.0"))
+    t0 = time.time()
+    maps, sources = [], []
+    for ds in datasets:
+        loader = ds.episode_loader
+        version = int(version_raw) if version_raw else ds.frames_version
+        res = run_isolated(
+            "gr00t_lancedb.lance_query:query_anchor_weights",
+            {
+                **loader._isolated_kwargs(),
+                "column": column,
+                "lance_version": version,
+            },
+        )
+        m = map_frame_weights(
+            dataset_episode_anchors(ds), res["episode_index"], res["frame_index"], res["weight"], default=default
+        )
+        maps.append(m)
+        sources.append(
+            {
+                "dataset": str(loader.dataset_path),
+                "weight_version": int(res["frames_version"]),
+                "rows_frames_version": ds.frames_version,
+                "anchors": len(m),
+                "missing": m.missing,
+                "nonfinite": m.nonfinite,
+                "provenance": res.get("field_metadata", {}),
+            }
+        )
+        if m.missing:
+            logger.warning(
+                "%s: %d of %d anchors have no %r row; using default weight %s",
+                loader.dataset_path, m.missing, len(m), column, default,
+            )
+    weighted = build_weighted_anchors(
+        maps, mix_weights, column=column, info={"sources": sources, "load_s": round(time.time() - t0, 3)}
+    )
+    logger.info("Weighted anchors: %s", {k: v for k, v in weighted.summary().items() if k != "sources"})
+    return weighted
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +1024,12 @@ def main() -> None:
                 # The preemption callback may os._exit() in on_train_end before ours runs.
                 bench_cb.preempt_cb.pre_exit_hooks.append(bench_cb.write_train_end)
             self.add_callback(bench_cb)
+            from gr00t_lancedb.flywheel.checkpoints import KeepCheckpointsCallback
+
+            keep_cb = KeepCheckpointsCallback.from_env()
+            if keep_cb is not None:
+                phase_box["keep_ckpt_steps"] = sorted(keep_cb.keep_steps)
+                self.add_callback(keep_cb)
             t_init1 = time.time()
             phase_box["trainer_init_s"] = t_init1 - t_init0
             _append_metric_line(

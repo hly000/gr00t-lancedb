@@ -297,6 +297,7 @@ class ExactResumeMixin:
         decode_batch_size: int = 32,
         prefetch_batches: int = 2,
         first_decode_batch_size: int | None = None,
+        weighted_anchors: Any = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -317,6 +318,12 @@ class ExactResumeMixin:
             int(first_decode_batch_size) if first_decode_batch_size is not None else self.decode_batch_size
         )
         self.prefetch_batches = int(prefetch_batches)
+        # Flywheel round 2: draw anchors i.i.d. from a per-anchor weight column instead of the
+        # shuffle buffer (``gr00t_lancedb.flywheel.weights.WeightedAnchors``). Always decoded
+        # lazily; the stream depends only on (seed, rank, logical worker), so resume is exact.
+        self.weighted_anchors = weighted_anchors
+        if weighted_anchors is not None:
+            self.lazy_decode = True
         self.resume_batches = 0
         self.loader_batch_size: int | None = None
 
@@ -340,6 +347,11 @@ class ExactResumeMixin:
             "decode_batch_size": self.decode_batch_size,
             "first_decode_batch_size": self.first_decode_batch_size,
             "prefetch_batches": self.prefetch_batches,
+            "weighted_anchors": (
+                None
+                if self.weighted_anchors is None
+                else {"column": self.weighted_anchors.column, "digest": self.weighted_anchors.digest}
+            ),
         }
 
     def reset_seed(self, seed: int) -> None:  # pragma: no cover - guard
@@ -369,6 +381,14 @@ class ExactResumeMixin:
         stride = self.world_size * num_workers
         slot = self.rank * num_workers + logical
         return [shard for i, shard in enumerate(self.shard_sampling_schedule) if i % stride == slot]
+
+    def _resume_skip(self) -> int:
+        """Samples this (logical) worker already served before the resume point."""
+        if not self.resume_batches:
+            return 0
+        if not self.loader_batch_size:
+            raise ValueError("set_resume_point() needs the DataLoader batch size")
+        return served_by_worker(self.resume_batches, self.num_workers, self.worker_id, self.loader_batch_size)
 
     def _sample_seed(self, served: int) -> int:
         ss = np.random.SeedSequence([int(self.seed), int(self.rank), int(self.worker_id or 0), served])
@@ -426,25 +446,36 @@ class ExactResumeMixin:
             served += 1
             return chosen
 
-        # Integer-only skip on resume: zero buffer decoding!
+        yield from self._serve_anchor_stream(draw_one, skip, label="lazy-decode")
+
+    def _iter_weighted(self, skip: int):
+        """Weighted i.i.d. anchor draws (flywheel round 2), decoded like the lazy path."""
+        stream = self.weighted_anchors.stream(self.seed, self.rank, int(self.worker_id or 0))
+        yield from self._serve_anchor_stream(lambda: next(stream), skip, label="weighted")
+
+    def _serve_anchor_stream(self, draw_one, skip: int, *, label: str):
+        """Skip ``skip`` draws (integer-only), then decode anchors in prefetched chunks."""
+        served = 0
         while served < skip:
             draw_one()
+            served += 1
         if skip:
             logger.info(
-                "rank %d worker %d: lazy-decode resumed after %d served samples (0 buffer splits decoded)",
-                self.rank, self.worker_id, skip,
+                "rank %d worker %d: %s resumed after %d served samples (0 buffer splits decoded)",
+                self.rank, self.worker_id, label, skip,
             )
 
         n_chunks = 0
 
         def next_chunk() -> list[tuple[int, int, int, int]]:
-            nonlocal n_chunks
+            nonlocal n_chunks, served
             size = self.first_decode_batch_size if n_chunks == 0 else self.decode_batch_size
             n_chunks += 1
             chunk_meta: list[tuple[int, int, int, int]] = []
             for _ in range(size):
                 s_idx = served
                 ds_idx, ep_idx, step_idx = draw_one()
+                served += 1
                 chunk_meta.append((s_idx, ds_idx, ep_idx, step_idx))
             return chunk_meta
 
@@ -482,16 +513,15 @@ class ExactResumeMixin:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def __iter__(self):
+        if self.weighted_anchors is not None:
+            # Resolves this physical worker's *logical* id; the shard schedule itself is unused.
+            self.filter_shard_sample_schedule()
+            yield from self._iter_weighted(self._resume_skip())
+            return
+
         rng = np.random.default_rng(self.seed + self.epoch)
         splits = self._iter_splits(self._worker_schedule())
-
-        skip = 0
-        if self.resume_batches:
-            if not self.loader_batch_size:
-                raise ValueError("set_resume_point() needs the DataLoader batch size")
-            skip = served_by_worker(
-                self.resume_batches, self.num_workers, self.worker_id, self.loader_batch_size
-            )
+        skip = self._resume_skip()
 
         if self.lazy_decode:
             yield from self._iter_lazy_decode(rng, splits, skip)

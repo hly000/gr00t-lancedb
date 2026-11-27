@@ -44,6 +44,7 @@ gr00t-lance-attach = "gr00t_lancedb.convert:main_attach"
 gr00t-lance-curate = "gr00t_lancedb.curate:main_curate"
 gr00t-lance-vector-curate = "gr00t_lancedb.vector_curate:main_vector_curate"
 gr00t-spot-bench = "gr00t_lancedb.bench.cli:main"
+gr00t-lance-flywheel = "gr00t_lancedb.flywheel.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

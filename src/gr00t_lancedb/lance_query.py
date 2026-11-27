@@ -154,6 +154,53 @@ def query_where_anchors(
     return out
 
 
+def query_anchor_weights(
+    *,
+    dataset_path: str,
+    column: str,
+    lance_version: int | None = None,
+    repo_id: str | None = None,
+    storage_options: dict[str, str] | None = None,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> dict[str, Any]:
+    """``SELECT episode_index, frame_index, <column> FROM frames`` at one version.
+
+    Used by the flywheel's weighted round 2: only two int columns and one float column are
+    read (never ``videos.lance``). The column's Arrow field metadata (provenance written by
+    :func:`gr00t_lancedb.flywheel.mining.write_flywheel_columns`) is returned as well.
+    """
+    db, options, db_uri, _ = _connect(
+        dataset_path, repo_id=repo_id, storage_options=storage_options, revision=revision, token=token
+    )
+    table = _open(db, FRAMES_TABLE, options or None)
+    if lance_version is not None:
+        table.checkout(int(lance_version))
+    if column not in table.schema.names:
+        raise KeyError(f"frames.lance v{table.version} has no column {column!r}")
+    field_meta = table.schema.field(column).metadata or {}
+    tbl = (
+        table.search()
+        .select(["episode_index", "frame_index", column])
+        .limit(None)
+        .to_arrow()
+    )
+
+    def col(name: str, dtype) -> np.ndarray:
+        return tbl.column(name).combine_chunks().to_numpy(zero_copy_only=False).astype(dtype, copy=False)
+
+    return {
+        "frames_version": int(table.version),
+        "db_uri": db_uri,
+        "column": column,
+        "episode_index": col("episode_index", np.int64),
+        "frame_index": col("frame_index", np.int64),
+        # NULLs come back as NaN and are treated like missing rows by the caller.
+        "weight": col(column, np.float64),
+        "field_metadata": {k.decode(): v.decode() for k, v in field_meta.items()},
+    }
+
+
 def materialize_meta(
     *,
     dataset_path: str,
@@ -169,4 +216,4 @@ def materialize_meta(
     return {"db_uri": db_uri, "local_root": str(local_root)}
 
 
-__all__ = ["fetch_versioned_meta", "materialize_meta", "query_where_anchors"]
+__all__ = ["fetch_versioned_meta", "materialize_meta", "query_anchor_weights", "query_where_anchors"]
