@@ -358,7 +358,10 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
     if args.compile:
         ah.model = torch.compile(ah.model, mode="default")
 
-    opt, opt_name = build_action_head_optimizer(ah, lr=args.lr, weight_decay=args.weight_decay, use_8bit=False)
+    opt, opt_name = build_action_head_optimizer(
+        ah, lr=args.lr, weight_decay=args.weight_decay, kind=args.optimizer, seed=args.seed
+    )
+    lowmem = opt_name.startswith("LowMemAdamW")
     warmup_steps = max(1, int(args.max_steps * args.warmup_ratio))
 
     def _lr_lambda(step: int) -> float:
@@ -426,8 +429,13 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             loss = ah(bb_out, act_in)["loss"]
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(ah.parameters(), 1.0)
-        opt.step()
+        if lowmem:
+            # fold the clip factor into the fused update instead of rewriting bf16 grads in place
+            _, clip = opt.clip_scale(1.0)
+            opt.step(grad_scale=clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(ah.parameters(), 1.0)
+            opt.step()
         sched.step()
         torch.cuda.synchronize()
 
@@ -491,6 +499,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         "token_dropout": args.token_dropout,
         "gaussian_jitter": args.gaussian_jitter,
         "optimizer": opt_name,
+        "param_dtype": str(param_dtype).replace("torch.", ""),
+        "optimizer_state_gb": round(opt.state_bytes() / 1024**3, 3) if lowmem else None,
         "materialize_s": mat_summary.get("total_wall_s"),
         "train_loop_s": round(train_loop_s, 2),
         "train_total_wall_s": round(time.perf_counter() - t_train_start, 2),
@@ -527,6 +537,12 @@ def main() -> None:
     p.add_argument("--token-dropout", type=float, default=0.0)
     p.add_argument("--gaussian-jitter", type=float, default=0.0)
     p.add_argument("--fp32-master-weights", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--optimizer",
+        choices=["adamw", "bnb8bit", "lowmem"],
+        default="adamw",
+        help="lowmem = 8-bit moments + Kahan-compensated bf16 weights; pair it with --no-fp32-master-weights",
+    )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)

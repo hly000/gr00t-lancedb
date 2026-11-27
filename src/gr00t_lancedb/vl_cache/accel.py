@@ -363,12 +363,27 @@ def build_action_head_optimizer(
     use_8bit: bool = True,
     betas: tuple[float, float] = (0.95, 0.999),
     eps: float = 1e-8,
+    kind: str | None = None,
+    seed: int = 0,
 ) -> tuple[Any, str]:
-    """Build AdamW (preferring 8-bit AdamW when requested and available) for trainable params."""
+    """Build the optimizer for the trainable parameters.
+
+    ``kind``: ``"adamw"`` (torch fused), ``"bnb8bit"`` (bitsandbytes), or ``"lowmem"``
+    (:class:`gr00t_lancedb.turbo.LowMemAdamW`: 8-bit moments, Kahan-compensated bf16 weights).
+    ``kind=None`` keeps the old ``use_8bit`` behaviour (bitsandbytes if importable, else fused).
+    An explicitly requested kind never falls back silently.
+    """
     import torch
 
     params = [p for p in action_head.parameters() if p.requires_grad]
-    if use_8bit:
+    if kind is None:
+        kind = "bnb8bit_or_adamw" if use_8bit else "adamw"
+    if kind == "lowmem":
+        from gr00t_lancedb.turbo import LowMemAdamW, triton_available
+
+        opt = LowMemAdamW(params, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, seed=seed)
+        return opt, f"LowMemAdamW({'triton' if triton_available() else 'torch'})"
+    if kind in ("bnb8bit", "bnb8bit_or_adamw"):
         try:
             import bitsandbytes as bnb
 
@@ -377,7 +392,10 @@ def build_action_head_optimizer(
                 "bitsandbytes.AdamW8bit",
             )
         except ImportError:
-            pass
+            if kind == "bnb8bit":
+                raise
+    elif kind != "adamw":
+        raise ValueError(f"unknown optimizer kind {kind!r}")
     try:
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, fused=True)
         return opt, "torch.AdamW(fused)"
