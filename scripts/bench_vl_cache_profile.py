@@ -60,7 +60,7 @@ def _build_gr00t_processor(cfg: Any, tag: Any, modality_configs: dict[str, Any],
 
     return Gr00tN1d7Processor(
         modality_configs={tag.value: modality_configs},
-        statistics=stats,
+        statistics={tag.value: stats} if stats is not None else None,
         use_percentiles=getattr(cfg, "use_percentiles", True),
         image_crop_size=getattr(cfg, "image_crop_size", None),
         image_target_size=getattr(cfg, "image_target_size", None),
