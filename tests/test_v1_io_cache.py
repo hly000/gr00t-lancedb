@@ -276,13 +276,22 @@ def test_bench_loader_io_epoch2_served_from_cache(v2_dataset_dir: Path, tmp_path
     """Data-only E2 tool: per-epoch I/O deltas, worker counters flushed at worker exit."""
     lance_dir = tmp_path / "lance"
     convert_v2_to_lance(v2_dataset_dir, lance_dir, video_mode="copy")
-    bench = _load_script("bench_loader_io")
+    import subprocess
+    import sys
+
+    # Fresh interpreter: this test process already opened Lance (Tokio) in earlier tests,
+    # and forking DataLoader workers after that is exactly what issue #1 forbids.
     out = tmp_path / "io.json"
-    rep = bench.main([
-        "--dataset", str(lance_dir), "--epochs", "2", "--batch-size", "4", "--num-workers", "2",
-        "--steady-decode-batch", "8", "--video-cache-gb", "1", "--video-cache-dir", str(tmp_path / "gop"),
-        "--video-cache-force-local", "--action-horizon", "4", "--out", str(out),
-    ])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])}
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "bench_loader_io.py"),
+         "--dataset", str(lance_dir), "--epochs", "2", "--batch-size", "4", "--num-workers", "2",
+         "--steady-decode-batch", "8", "--video-cache-gb", "1", "--video-cache-dir", str(tmp_path / "gop"),
+         "--video-cache-force-local", "--action-horizon", "4", "--out", str(out)],
+        capture_output=True, text=True, timeout=300, env=env, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    rep = json.loads(out.read_text())
     e1, e2 = rep["epochs"]
     assert rep["access_pattern"] in ("random_anchors_fallback", "gr00t_fast_sharded_mixture")
     assert e1["samples"] == e2["samples"] == rep["anchors"]
