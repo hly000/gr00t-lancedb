@@ -78,7 +78,7 @@ def _load_initial_actions_npz(path: Path) -> list[dict[str, Any]]:
         from gr00t.utils.initial_actions import load_initial_actions  # type: ignore[import-not-found]
 
         return load_initial_actions(path)
-    except ImportError:
+    except (ImportError, ValueError):
         pass
     data = np.load(path, allow_pickle=True)
     if "arr_0" in data and len(data.files) == 1:
