@@ -87,8 +87,22 @@ class IoStats:
             self._counts = dict.fromkeys(_IO_FIELDS, 0)
             self._last_flush = 0.0
 
+    def _register_exit_flush(self) -> None:
+        """Flush once more when this process exits (main: atexit; DataLoader workers:
+        multiprocessing finalizers, since worker processes leave via os._exit)."""
+        if getattr(self, "_exit_hook_pid", None) == os.getpid():
+            return
+        self._exit_hook_pid = os.getpid()
+        import atexit
+        from multiprocessing import util as mp_util
+
+        atexit.register(self.maybe_flush, True)
+        mp_util.Finalize(None, self.maybe_flush, args=(True,), exitpriority=10)
+
     def add(self, **deltas: int) -> None:
         self._check_pid()
+        if os.environ.get("GR00T_LANCE_IO_STATS_DIR"):
+            self._register_exit_flush()
         with self._lock:
             for k, v in deltas.items():
                 self._counts[k] = self._counts.get(k, 0) + int(v)

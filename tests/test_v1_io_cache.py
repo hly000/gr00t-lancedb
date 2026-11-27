@@ -270,3 +270,23 @@ def test_bench_callback_logs_emergency_save_once(tmp_path: Path) -> None:
     saves = [r for r in recs if r["event"] == "save"]
     assert len(saves) == 1 and saves[0]["emergency"] is True and saves[0]["global_step"] == 3
     assert saves[0]["decision"]["dtype"] == "bf16" and saves[0]["checkpoint"].endswith("checkpoint-3")
+
+
+def test_bench_loader_io_epoch2_served_from_cache(v2_dataset_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    """Data-only E2 tool: per-epoch I/O deltas, worker counters flushed at worker exit."""
+    lance_dir = tmp_path / "lance"
+    convert_v2_to_lance(v2_dataset_dir, lance_dir, video_mode="copy")
+    bench = _load_script("bench_loader_io")
+    out = tmp_path / "io.json"
+    rep = bench.main([
+        "--dataset", str(lance_dir), "--epochs", "2", "--batch-size", "4", "--num-workers", "2",
+        "--steady-decode-batch", "8", "--video-cache-gb", "1", "--video-cache-dir", str(tmp_path / "gop"),
+        "--video-cache-force-local", "--action-horizon", "4", "--out", str(out),
+    ])
+    e1, e2 = rep["epochs"]
+    assert rep["access_pattern"] in ("random_anchors_fallback", "gr00t_fast_sharded_mixture")
+    assert e1["samples"] == e2["samples"] == rep["anchors"]
+    assert e1["lance_ranges_per_sample"] > 0 and e1["gop_cache_hit_rate"] < 1.0
+    assert e2["lance_ranges_per_sample"] == 0 and e2["gop_cache_hit_rate"] == 1.0
+    assert e2["frames_takes_per_sample"] > 0
+    assert json.loads(out.read_text())["epochs"][1]["epoch"] == 1
