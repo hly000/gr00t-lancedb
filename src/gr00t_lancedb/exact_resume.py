@@ -858,7 +858,8 @@ def _make_preempt_callback(
     ``GR00T_PREEMPT_EST_SAVE_S`` (unset = self-calibrated; a number pins the estimate),
     ``GR00T_PREEMPT_PRIOR_WRITE_MBPS`` (400), ``GR00T_PREEMPT_SAVE_OVERHEAD_S`` (1.0),
     ``GR00T_PREEMPT_PROBE_MB`` (64; background fsync'ed probe write at train start, 0=off),
-    ``GR00T_PREEMPT_FSYNC`` (1).
+    ``GR00T_PREEMPT_FSYNC`` (1), ``GR00T_PREEMPT_FAST_EXIT`` (1: ``os._exit(143)`` once the
+    checkpoint decision is durable, skipping ~20 s of DataLoader / interpreter teardown).
     """
     from transformers import TrainerCallback
 
@@ -879,6 +880,10 @@ def _make_preempt_callback(
     overhead_s = float(env.get("GR00T_PREEMPT_SAVE_OVERHEAD_S", "1.0"))
     probe_mb = int(float(env.get("GR00T_PREEMPT_PROBE_MB", "64")))
     do_fsync = env.get("GR00T_PREEMPT_FSYNC", "1") == "1"
+    # A100 run: after the decision, `raise SystemExit` still spent ~22 s tearing down
+    # DataLoader workers / CUDA / the interpreter, which alone eats most of a 30 s grace
+    # period. Everything durable is written by then, so exit immediately.
+    fast_exit = env.get("GR00T_PREEMPT_FAST_EXIT", "1") == "1"
 
     class PreemptCallback(TrainerCallback):
         def __init__(self) -> None:
@@ -896,6 +901,9 @@ def _make_preempt_callback(
             self.last_decision: dict[str, Any] | None = None
             self.calibration = WriteBandwidthCalibration(None, prior_bps, overhead_s)
             self._output_dir: Path | None = None
+            self.fast_exit = fast_exit
+            # Callables run right before a fast exit (e.g. metrics writers' train_end).
+            self.pre_exit_hooks: list[Any] = []
 
         @property
         def avg_step_s(self) -> float:
@@ -1081,6 +1089,22 @@ def _make_preempt_callback(
             self._log_event(decision)
             return control
 
+        def _exit_now(self, code: int) -> None:
+            import sys
+
+            for hook in self.pre_exit_hooks:
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - never block the exit
+                    pass
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+            logging.shutdown()
+            os._exit(code)
+
         def on_train_end(self, args, state, control, **kwargs):
             monitor.restore()
             if monitor.preempted and exit_on_preempt:
@@ -1094,6 +1118,17 @@ def _make_preempt_callback(
                 else:
                     msg = f"Preempted at step {state.global_step}: checkpoint saved; exiting (143)."
                 logger.warning("%s", msg)
+                sig_t = getattr(monitor, "signal_time", None)
+                self._log_event(
+                    {
+                        "event": "preempt_exit",
+                        "global_step": int(state.global_step),
+                        "signal_to_exit_s": (time.time() - sig_t) if sig_t else None,
+                        "fast_exit": self.fast_exit,
+                    }
+                )
+                if self.fast_exit:
+                    self._exit_now(143)
                 raise SystemExit(143)
 
     return PreemptCallback()

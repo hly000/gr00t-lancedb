@@ -296,6 +296,8 @@ def make_bench_callback(
             # Set by BenchTrainer: the exact-resume preemption callback (runs before us).
             self.preempt_cb = None
             self._logged_decision = None
+            self._train_end_written = False
+            self._last_step = 0
 
         def _write(self, rec: dict) -> None:
             if self.fh is None:
@@ -364,6 +366,7 @@ def make_bench_callback(
         def on_step_end(self, args, state, control, **kwargs):
             # Capture step completion timestamp BEFORE expensive _memory_mb() / disk flush!
             now = time.time()
+            self._last_step = int(state.global_step)
             t0 = self.t_prev_end or now
             step_s = now - t0
             util, gmem = self.gpu.window(t0, now)
@@ -456,20 +459,28 @@ def make_bench_callback(
             if logs and "loss" in logs:
                 self._write({"event": "log", "global_step": int(state.global_step), "t": time.time(), **logs})
 
-        def on_train_end(self, args, state, control, **kwargs):
-            self._write(
-                {
-                    "event": "train_end",
-                    "t": time.time(),
-                    "since_launch_s": time.time() - launch_t0,
-                    "global_step": int(state.global_step),
-                    "peak": self.peak,
-                }
-            )
+        def write_train_end(self, state=None) -> None:
+            if self._train_end_written:
+                return
+            self._train_end_written = True
+            rec = {
+                "event": "train_end",
+                "t": time.time(),
+                "since_launch_s": time.time() - launch_t0,
+                "global_step": int(state.global_step) if state is not None else self._last_step,
+                "peak": self.peak,
+            }
+            decision = getattr(self.preempt_cb, "last_decision", None)
+            if decision is not None:
+                rec["preempted"] = True
+            self._write(rec)
             self.gpu.stop()
             if self.fh:
                 self.fh.close()
                 self.fh = None
+
+        def on_train_end(self, args, state, control, **kwargs):
+            self.write_train_end(state)
 
     return BenchMetricsCallback()
 
@@ -939,6 +950,9 @@ def main() -> None:
             bench_cb.preempt_cb = next(
                 (c for c in self.callback_handler.callbacks if hasattr(c, "last_decision")), None
             )
+            if bench_cb.preempt_cb is not None:
+                # The preemption callback may os._exit() in on_train_end before ours runs.
+                bench_cb.preempt_cb.pre_exit_hooks.append(bench_cb.write_train_end)
             self.add_callback(bench_cb)
             t_init1 = time.time()
             phase_box["trainer_init_s"] = t_init1 - t_init0

@@ -155,6 +155,10 @@ class SpotPreemptionMonitor:
         self._previous_handlers: dict[int, Any] = {}
 
     def _handle(self, signum: int, _frame: Any) -> None:
+        if not self.preempted:
+            import time
+
+            self.signal_time = time.time()
         self.preempted = True
         self.received_signal = signum
         logger.warning(

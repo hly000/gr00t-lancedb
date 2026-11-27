@@ -192,3 +192,54 @@ def test_callback_auto_picks_smaller_preset_and_logs(tmp_path: Path, monkeypatch
     assert events[-1]["event"] == "preempt_decision" and events[-1]["save"]["bytes"] > 0
     assert json.loads((tmp_path / CALIBRATION_FILENAME).read_text())["samples"][-1]["source"] == "emergency"
     assert control.should_training_stop is True and control.should_save is False
+
+
+def test_fast_exit_skips_teardown_and_runs_hooks(tmp_path: Path) -> None:
+    """A100 run: SystemExit after a skipped save still took ~22 s of teardown. Fast exit must not."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    script = tmp_path / "fast_exit.py"
+    script.write_text(textwrap.dedent(f"""
+        import threading, time
+        from pathlib import Path
+        from types import SimpleNamespace
+        from gr00t_lancedb.exact_resume import _make_preempt_callback
+
+        class Mon:
+            preempted = True
+            signal_time = time.time()
+            def install(self): pass
+            def restore(self): pass
+            def broadcast_preempted(self): return True
+
+        # Non-daemon thread = stand-in for DataLoader workers / pin-memory threads at shutdown.
+        threading.Thread(target=time.sleep, args=(30,)).start()
+        cb = _make_preempt_callback(Mon(), exit_on_preempt=True, est_save_s=1e9)
+        out = Path({str(tmp_path)!r})
+        cb.pre_exit_hooks.append(lambda: (out / "hook.txt").write_text("ran"))
+        args = SimpleNamespace(output_dir=str(out), should_save=True)
+        state = SimpleNamespace(global_step=10)
+        control = SimpleNamespace(should_save=False, should_training_stop=False)
+        cb.on_train_begin(args, state, control)
+        cb.last_saved_step = 5
+        state.global_step = 12
+        cb.on_step_end(args, state, control)   # cost gate: skip
+        cb.on_train_end(args, state, control)  # must os._exit(143) right away
+        print("NOT REACHED")
+    """))
+    env = {**os.environ, "GR00T_PREEMPT_PROBE_MB": "0",
+           "PYTHONPATH": os.pathsep.join([str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH", "")])}
+    t0 = time.monotonic()
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=25, env=env)
+    elapsed = time.monotonic() - t0
+    assert proc.returncode == 143, proc.stderr[-2000:]
+    assert "NOT REACHED" not in proc.stdout
+    assert elapsed < 15, f"fast exit took {elapsed:.1f}s"
+    assert (tmp_path / "hook.txt").read_text() == "ran"
+    events = [json.loads(ln) for ln in (tmp_path / PREEMPT_EVENTS_FILENAME).read_text().splitlines()]
+    assert [e["event"] for e in events] == ["preempt_decision", "preempt_exit"]
+    assert events[0]["action"] == "skip" and events[1]["signal_to_exit_s"] < 15
