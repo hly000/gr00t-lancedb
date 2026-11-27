@@ -289,12 +289,23 @@ class VLCacheReader:
         return self._key_to_row
 
     def take_rows_arrow(self, row_indices: Sequence[int], columns: Sequence[str] | None = None) -> pa.Table:
-        """Fetch a PyArrow table for the given physical row offsets using native LanceDB take."""
+        """Fetch a PyArrow table in exact ``row_indices`` order using native LanceDB take.
+
+        ``lancedb.Table.take_offsets`` returns rows sorted by offset and deduplicated, so we
+        fetch unique sorted offsets and permute back to the exact requested order.
+        """
         self._ensure_open()
-        q = self._table.take_offsets(list(row_indices))
+        req = [int(i) for i in row_indices]
+        unique_sorted = sorted(set(req))
+        q = self._table.take_offsets(unique_sorted)
         if columns is not None:
             q = q.select(list(columns))
-        return q.to_arrow()
+        tbl = q.to_arrow()
+        if req != unique_sorted:
+            pos = {off: idx for idx, off in enumerate(unique_sorted)}
+            perm = [pos[off] for off in req]
+            tbl = tbl.take(perm)
+        return tbl
 
     def take_rows(self, row_indices: Sequence[int]) -> list[EncodedVLRow]:
         """Fetch a batch of rows by physical row index using Lance's O(1) random ``take_offsets()``."""
