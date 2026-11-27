@@ -107,7 +107,23 @@
 | 显存峰值 | 37.9 GB | 37.9 GB | 37.9 GB | 37.9 GB |
 
 - GPU 是瓶颈，所有组稳态持平。GPU 利用率用的是 nvidia-smi，方案要求的 DCGM SM Active 还没接。
-- **读放大**：C 组 300 步（9,600 个样本）期间，网卡收了 746 MB；原生组训练期间（数据已在本地）收了 152 MB，是同期的其他流量。粗估 Lance 每个样本读约 60 KB，因为解码一帧要取到它所在的 GOP。长时间训练会反复读同一份数据，同区域流量免费，但 GCS/S3 按请求次数计费，必须进成本模型。
+- **读放大**：C 组 300 步（9,600 个样本）期间，网卡收了 746 MB；原生组训练期间（数据已在本地）收了 152 MB，是同期的其他流量。粗估 Lance 每个样本读约 60 KB。原因不是 GOP：LIBERO 视频的 GOP = 2（`ffprobe -show_frames` 实测 `I P I P…`，也是 LeRobot 编码的默认值 `g=2`），取一帧最多读 2 帧，约 6.5 KB。见下面的复现。
+
+**读放大的来源**（2026-11-27，CPU 复现，`scripts/measure_read_amp.py`）：LIBERO-10 前 40 个 episode 的子集（只保留 episode 0–39 的 parquet 和 MP4，`meta/episodes.jsonl`、`meta/episodes_stats.jsonl` 截到这 40 条，`info.json` 的总数同步改小；共 11,144 帧，视频 68.6 MB）放进本地 moto S3，前面加一个统计字节数的代理，按 GR00T fast loader 的方式（shard → split → `load_split`）读一个 epoch：
+
+| `episode_sampling_rate` | 每样本读取 | 其中视频 / frames 表 | 一个 epoch 读的视频 ÷ 视频总量 | 视频请求数 |
+|---|---|---|---|---|
+| 0.1（GR00T 默认） | 44.5 KB | 41.5 / 3.0 KB | 6.4× | 2,892 |
+| 1.0 | 6.8 KB | 6.5 / 0.3 KB | 1.0× | 170 |
+
+三件事叠在一起：
+1. `episode_sampling_rate=0.1` 把每个 episode 拆成 10 个 split，每个 split 是这个 episode 随机 1/10 的帧（LIBERO 约 26 帧），散布在整条视频上；10 个 split 分在不同 shard，不同时间加载。
+2. 每帧只需要它所在的 GOP（约 6.5 KB），但 26 个 GOP 分布在约 850 KB 的视频里，平均间隔约 33 KB。
+3. Lance 的 `fetch_blob_ranges` 会把间隔 ≤ 64 KiB 的区间合并成一个 HTTP 请求：实测两段 6 KB 间隔 60 KB 时合并成一个 72 KB 的请求，间隔 70 KB 时分成两个请求。
+
+结果是每个 split 读到每条视频的约 64%，每个 episode 一个 epoch 读 10 次，约 6.4 倍。lerobot-lancedb 自己的区间合并（`reader._merge_spans`）不是原因：在 LIBERO 上改成 0（`--reader-merge-gap 0`）结果基本不变，Lance 在下面还会再合并一次。frames 表一个 epoch 读了整张表的约 39 倍，只占总量约 7%，没有细查。
+
+这个放大是拿字节换请求数：合并后每样本约 0.27 个请求，不合并约 2 个。同区域流量免费、请求按次计费；单卡约 47 样本/s × 45 KB ≈ 2 MB/s，带宽也不紧张。所以它**不是 v0 的成本或吞吐瓶颈**。44.5 KB 与网卡估算的约 60 KB 之间的差距（多 worker 各自打开表、精确续训 loader、TCP/TLS 开销、背景流量减法不准）还没逐项验证。
 
 ### P4a 抢占 🟡（单次确定性 SIGTERM，第 150 步，数据在本地，save_steps=100）
 
@@ -160,7 +176,7 @@
 | 1 | 首个 batch 19–22 s（原生 7.5 s） | ①在模型加载**期间**就启动 DataLoader 迭代器并预取首批；②预热 forkserver 时顺便打开表；③首次填充用 `min_fill` 小缓冲先出数，同时保持顺序确定 | 冷启动追平或超过原生 |
 | 2 | 续训冷启动 131 s（原生 71 s） | 拆分各段耗时（加载检查点、forkserver、重放、表打开）；怀疑 forkserver 预加载和加载检查点抢 CPU/IO | −40~60 s |
 | 3 | SIGTERM 写 24 GB 检查点要 55 s | 用代价模型决定保不保存（距上次存档的步数 × 单步时间 > 保存耗时才存）；只存模型和优化器；异步上传 S3 | 抢占总耗时追平或超过原生 |
-| 4 | 读放大约 60 KB/样本 | 按 GOP 合并同一视频段的样本；本地盘做 LRU 缓存（对象存储做后备）；`sample_index` 粒度调优 | 请求数/字节数 −50% 以上 |
+| 4 | 读放大约 45–60 KB/样本：稀疏 split + Lance 的 64 KiB 合并，每个 epoch 视频读约 6.4 遍（见 P3） | 请求数已经很低（约 0.27 次/样本），降字节只能拿请求数换：按区间分开调用 `fetch_blob_ranges` 绕过合并；或在同一 episode 的 10 个 split 之间缓存视频字节（缓存要接近数据集大小） | 字节数成为瓶颈（跨区域、多卡共享带宽）时再做；请求数和字节数不能同时降 |
 | 5 | 每个解码线程各开一个 reader，各带 16 线程解码池 | 按 worker 共享解码池，控制总线程数 | CPU 占用下降 |
 | 6 | forkserver 里 lancedb 报"fork 支持是实验性的"警告 | 预加载时不导入 lancedb，或者改用 spawn 加预热 | 消除隐患 |
 | 7 | 内存 PSS 在 gVisor 下测不准 | 换普通 VM 再测 PSS，加"数据集规模 × 内存"曲线 | H4 证据补全 |
@@ -214,6 +230,9 @@ BACKEND=lance DATASET=… OUT=… MAX_STEPS=300 SAVE_STEPS=100 KILL_AT_STEP=150 
   bash scripts/preempt_experiment.sh
 python scripts/compare_fingerprints.py REF_RUN PREEMPTED_RUN/pre
 python scripts/summarize_runs.py a=RUN_A b=RUN_B
+
+# 读放大（只要 CPU；本地 moto S3 + 计字节代理；--v2-dir 是 P3 里说的 40 个 episode 子集，需带 meta/modality.json）python scripts/measure_read_amp.py --v2-dir /data/datasets/libero_10_first40 --rates 0.1,1.0
+python scripts/measure_read_amp.py --v2-dir /data/datasets/libero_10_first40 --rates 0.1 --reader-merge-gap 0
 ```
 
 原始结果已存进仓库 [`results/v0/`](../results/v0)：`exp4/`（本地，含抢占）、`exp5/`（GCS）的逐步指标 `bench_metrics.jsonl` 和事件时间线 `events.jsonl`，以及 `results/*.json`（正确性检查）。
