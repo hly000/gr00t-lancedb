@@ -1,0 +1,13 @@
+{
+  "db_uri": "/data/tmp/vl_cache_demo",
+  "table_name": "vl_cache_abd3d033",
+  "fingerprint": "abd3d033bd100b47df9f499d8d3be6c629f29763fbb313fd220dc8bc9f0bb67a",
+  "rows_written": 2000,
+  "payload_bytes_written": 623474706,
+  "avg_bytes_per_row": 311737.353,
+  "total_wall_s": 77.05,
+  "inference_and_write_s": 52.85,
+  "frames_per_s": 37.84,
+  "codec": "per_token_int8",
+  "peak_alloc_gb": 7.102
+}

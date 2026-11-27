@@ -1,0 +1,12 @@
+{
+  "optimizer": "torch.AdamW(fused)",
+  "frames_per_step": 8,
+  "k_noise": 4,
+  "effective_fm_batch": 32,
+  "lance_take_dequant_aug_ms": 12.39,
+  "gpu_step_ms": 111.61,
+  "total_step_ms": 124.0,
+  "speedup_vs_native_483ms_x": 3.9,
+  "peak_alloc_gb": 13.026,
+  "peak_reserved_gb": 14.217
+}

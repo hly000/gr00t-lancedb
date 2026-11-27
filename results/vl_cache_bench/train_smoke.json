@@ -1,0 +1,30 @@
+{
+  "numerical_parity": {
+    "loss_online_bf16": 1.25,
+    "loss_bf16_raw": 1.25,
+    "abs_diff_bf16_raw": 0.0,
+    "rel_diff_bf16_raw": 0.0,
+    "loss_per_token_int8": 1.25,
+    "abs_diff_per_token_int8": 0.0,
+    "rel_diff_per_token_int8": 0.0
+  },
+  "lance_cached_train": {
+    "num_cached_rows": 2000,
+    "batch_size": 32,
+    "optimizer": "bitsandbytes.AdamW8bit",
+    "lance_take_and_h2d_ms": 30.21,
+    "gpu_step_ms": 237.49,
+    "total_step_ms": 267.7,
+    "peak_alloc_gb": 11.349,
+    "peak_reserved_gb": 12.184
+  },
+  "storage_random_read_bench": {
+    "num_rows": 2000,
+    "batch_size": 32,
+    "lance_take_ms": 23.25,
+    "pt_scatter_ms": 115.35,
+    "parquet_scan_take_ms": 3691.99,
+    "lance_vs_pt_x": 4.96,
+    "lance_vs_parquet_x": 158.8
+  }
+}

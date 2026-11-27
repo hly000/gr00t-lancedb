@@ -1,0 +1,91 @@
+{
+  "gpu_name": "NVIDIA A100-SXM4-40GB",
+  "gpu_total_gb": 39.49,
+  "base_model_path": "nvidia/GR00T-N1.7-3B",
+  "dataset_path": "/data/datasets/libero_10_lance",
+  "batch_size": 32,
+  "warmup_steps": 5,
+  "measure_steps": 20,
+  "configs": {
+    "native_full": {
+      "optimizer": "torch.AdamW(fused)",
+      "load_s": 18.17,
+      "seq_len_sample": 151,
+      "prep_ms": 30.25,
+      "backbone_fwd_ms": 296.9,
+      "action_head_fwd_ms": 55.55,
+      "action_head_bwd_ms": 79.13,
+      "optim_ms": 19.84,
+      "total_step_ms": 483.35,
+      "backbone_share_pct": 61.4,
+      "theoretical_cache_ceiling_x": 2.59,
+      "peak_alloc_gb": 17.087,
+      "peak_reserved_gb": 17.807
+    },
+    "online_multinoise_B_k4": {
+      "effective_fm_batch": 128,
+      "total_step_ms": 644.21,
+      "ms_per_fm_sample_speedup_x": 3.0,
+      "peak_alloc_gb": 27.419,
+      "peak_reserved_gb": 29.895
+    },
+    "ah_only_adamw": {
+      "optimizer": "torch.AdamW(fused)",
+      "load_s": 15.53,
+      "h2d_ms": 15.42,
+      "fwd_ms": 56.08,
+      "bwd_ms": 79.25,
+      "optim_ms": 19.84,
+      "total_step_ms": 171.32,
+      "speedup_vs_native_x": 2.82,
+      "peak_alloc_gb": 20.391,
+      "peak_reserved_gb": 21.467,
+      "fits_24gb": true
+    },
+    "ah_only_adamw8bit": {
+      "optimizer": "bitsandbytes.AdamW8bit",
+      "load_s": 15.5,
+      "h2d_ms": 15.55,
+      "fwd_ms": 57.14,
+      "bwd_ms": 79.58,
+      "optim_ms": 98.52,
+      "total_step_ms": 250.99,
+      "speedup_vs_native_x": 1.93,
+      "peak_alloc_gb": 17.475,
+      "peak_reserved_gb": 18.385,
+      "fits_24gb": true
+    },
+    "ah_only_adamw8bit_mn_k4_iso": {
+      "optimizer": "bitsandbytes.AdamW8bit",
+      "load_s": 15.46,
+      "h2d_ms": 1.64,
+      "fwd_ms": 51.17,
+      "bwd_ms": 63.68,
+      "optim_ms": 98.14,
+      "total_step_ms": 215.2,
+      "speedup_vs_native_x": 2.25,
+      "peak_alloc_gb": 16.265,
+      "peak_reserved_gb": 17.121,
+      "fits_24gb": true
+    },
+    "ah_only_adamw8bit_compile": {
+      "optimizer": "bitsandbytes.AdamW8bit",
+      "load_s": 15.48,
+      "h2d_ms": 15.62,
+      "fwd_ms": 41.04,
+      "bwd_ms": 72.41,
+      "optim_ms": 99.93,
+      "total_step_ms": 229.23,
+      "speedup_vs_native_x": 2.11,
+      "peak_alloc_gb": 17.481,
+      "peak_reserved_gb": 18.855,
+      "fits_24gb": true
+    }
+  },
+  "param_counts": {
+    "total": 3144016000,
+    "trainable": 1620515968,
+    "backbone": 1523500032,
+    "action_head": 1620515968
+  }
+}
