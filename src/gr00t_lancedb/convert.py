@@ -220,6 +220,7 @@ def _build_v3_compatible_meta_dir(
     src_meta_dir: Path,
     dst_meta_dir: Path,
     *,
+    modality_path: Path,
     info_v2: dict[str, Any],
     episodes_v2: list[dict[str, Any]],
     tasks_v2: list[dict[str, Any]],
@@ -236,8 +237,8 @@ def _build_v3_compatible_meta_dir(
     dst_meta_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Copy GR00T-specific metadata artifacts verbatim when present.
+    shutil.copy2(modality_path, dst_meta_dir / LEROBOT_MODALITY_FILENAME)
     for fname in (
-        LEROBOT_MODALITY_FILENAME,
         LEROBOT_EPISODES_FILENAME,
         LEROBOT_TASKS_FILENAME,
         LEROBOT_RELATIVE_STATS_FILENAME,
@@ -418,15 +419,15 @@ def convert_v2_to_lance(
         tasks_path = src_meta_dir / LEROBOT_TASKS_FILENAME
         tasks_v2 = _load_jsonl(tasks_path) if tasks_path.exists() else []
 
-        if modality_json_path is not None:
-            shutil.copy2(Path(modality_json_path), src_meta_dir / LEROBOT_MODALITY_FILENAME)
-        if not (src_meta_dir / LEROBOT_MODALITY_FILENAME).exists():
-            raise FileNotFoundError(
-                f"No {LEROBOT_MODALITY_FILENAME} found in {src_meta_dir}; pass modality_json_path=..."
-            )
-        modality_meta = json.loads(
-            (src_meta_dir / LEROBOT_MODALITY_FILENAME).read_text(encoding="utf-8")
+        # never write into src_meta_dir: for a local source it is the user's own dataset
+        modality_path = (
+            Path(modality_json_path)
+            if modality_json_path is not None
+            else src_meta_dir / LEROBOT_MODALITY_FILENAME
         )
+        if not modality_path.exists():
+            raise FileNotFoundError(f"{modality_path} not found; pass modality_json_path=...")
+        modality_meta = json.loads(modality_path.read_text(encoding="utf-8"))
 
         chunks_size = int(info_v2.get("chunks_size", 1000))
         fps = float(info_v2.get("fps", 30))
@@ -645,6 +646,7 @@ def convert_v2_to_lance(
             _build_v3_compatible_meta_dir(
                 src_meta_dir=src_meta_dir,
                 dst_meta_dir=meta_dst_dir,
+                modality_path=modality_path,
                 info_v2=info_v2,
                 episodes_v2=episodes_v2,
                 tasks_v2=tasks_v2,
