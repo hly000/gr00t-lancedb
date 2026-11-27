@@ -235,6 +235,7 @@ def test_auto_dtype_respects_deadline_once_encode_is_counted() -> None:
 
 
 def test_preempt_callback_budgets_encode(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("transformers")
     from gr00t_lancedb.exact_resume import _make_preempt_callback
 
     for var in ("GR00T_PREEMPT_EST_SAVE_S", "GR00T_PREEMPT_PRIOR_WRITE_MBPS", "GR00T_PREEMPT_PRIOR_ENCODE_MBPS"):
