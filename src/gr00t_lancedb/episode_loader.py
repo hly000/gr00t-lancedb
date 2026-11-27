@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from lerobot_lancedb import LanceDBDataset
+from lerobot_lancedb import FRAMES_TABLE, LanceDBDataset
 from lerobot_lancedb._source import is_remote_uri
 from lerobot_lancedb.reader import resolve_lance_root
 
@@ -102,6 +102,8 @@ class LanceEpisodeLoader:
         use_mini_mp4: bool = True,
         video_decoder_cache_size: int = 16,
         decoder_kwargs: dict[str, Any] | None = None,
+        where: str | None = None,
+        lance_version: int | None = None,
     ) -> None:
         self.dataset_path = str(dataset_path)
         self.repo_id = repo_id
@@ -113,6 +115,8 @@ class LanceEpisodeLoader:
         self.use_mini_mp4 = use_mini_mp4
         self.video_decoder_cache_size = video_decoder_cache_size
         self.decoder_kwargs = decoder_kwargs
+        self.where = where
+        self.lance_version = int(lance_version) if lance_version is not None else None
 
         # Resolve metadata root once without constructing a throwaway LanceDBDataset
         # (and without touching Lance/Tokio at all for local datasets or cached remote meta).
@@ -223,6 +227,93 @@ class LanceEpisodeLoader:
             int(ep["episode_index"]): pos for pos, ep in enumerate(self.episodes_metadata)
         }
 
+        # Optional frame-level SQL predicate pushdown against frames.lance (zero video reads).
+        self.valid_steps_by_episode: dict[int, np.ndarray] | None = None
+        if self.where is not None:
+            self.valid_steps_by_episode = self._resolve_valid_steps_from_where(
+                where=self.where,
+                lance_version=self.lance_version,
+            )
+
+    def _open_frames_table(self, lance_version: int | None = None) -> Any:
+        import lancedb
+
+        opts = self.storage_options
+        db = lancedb.connect(self.dataset_path, storage_options=opts) if opts else lancedb.connect(self.dataset_path)
+        table = db.open_table(FRAMES_TABLE, **({"storage_options": opts} if opts else {}))
+        if lance_version is not None:
+            table.checkout(lance_version)
+        return table
+
+    def _resolve_valid_steps_from_where(
+        self,
+        *,
+        where: str,
+        lance_version: int | None = None,
+    ) -> dict[int, np.ndarray]:
+        """Query ``frames.lance`` projecting ONLY ``["episode_index", "frame_index"]`` with ``where``.
+
+        NOTE: runs in the calling process, which starts lancedb's Tokio runtime here; it is
+        recorded so ``assert_unopened()`` refuses ``fork`` (see issue #1).
+        """
+        self._meta_opened_lance_pid = os.getpid()
+        with _OPEN_LOCK:
+            table = self._open_frames_table(lance_version=lance_version)
+            arrow_tbl = (
+                table.search()
+                .where(where)
+                .select(["episode_index", "frame_index"])
+                .limit(None)
+                .to_arrow()
+            )
+
+        valid_by_pos: dict[int, np.ndarray] = {
+            pos: np.empty(0, dtype=np.int64) for pos in range(len(self.episodes_metadata))
+        }
+        if arrow_tbl.num_rows == 0:
+            return valid_by_pos
+
+        ep_arr = arrow_tbl.column("episode_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+        frame_arr = arrow_tbl.column("frame_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+
+        order = np.lexsort((frame_arr, ep_arr))
+        ep_sorted = ep_arr[order]
+        frame_sorted = frame_arr[order]
+        unique_eps, split_starts = np.unique(ep_sorted, return_index=True)
+        split_ends = np.append(split_starts[1:], len(ep_sorted))
+
+        for ep_id_np, s, e in zip(unique_eps, split_starts, split_ends, strict=True):
+            pos = self._ep_id_to_pos.get(int(ep_id_np))
+            if pos is None:
+                continue
+            ep_frames = np.unique(frame_sorted[s:e])
+            ep_len = self.episode_lengths[pos]
+            if len(ep_frames):
+                lo = int(np.searchsorted(ep_frames, 0, side="left"))
+                hi = int(np.searchsorted(ep_frames, ep_len, side="left"))
+                valid_by_pos[pos] = np.ascontiguousarray(ep_frames[lo:hi], dtype=np.int64)
+        return valid_by_pos
+
+    def get_valid_steps_for_episode(
+        self,
+        ep_idx: int,
+        *,
+        max_step_exclusive: int | None = None,
+    ) -> np.ndarray:
+        """Return sorted valid anchor ``frame_index`` values for positional episode ``ep_idx``."""
+        limit = self.episode_lengths[ep_idx]
+        if max_step_exclusive is not None:
+            limit = min(limit, int(max_step_exclusive))
+        if limit <= 0:
+            return np.empty(0, dtype=np.int64)
+        if self.valid_steps_by_episode is None:
+            return np.arange(0, limit, dtype=np.int64)
+        steps = self.valid_steps_by_episode.get(ep_idx)
+        if steps is None or len(steps) == 0:
+            return np.empty(0, dtype=np.int64)
+        cutoff = int(np.searchsorted(steps, limit, side="left"))
+        return steps[:cutoff]
+
     # -- lazy worker-shared reader & fork safety ------------------------------------
     def _init_lock(self) -> None:
         self._io_lock = threading.Lock()
@@ -271,6 +362,15 @@ class LanceEpisodeLoader:
                 if getattr(r, "_frames_perm", None) is not None:
                     r._frames_perm = None
                 r._ensure_open()
+                if self.lance_version is not None:
+                    from lancedb.permutation import Permutation
+
+                    pinned_table = self._open_frames_table(lance_version=self.lance_version)
+                    r._frames_perm = (
+                        Permutation.identity(pinned_table)
+                        .select_columns(r._fetch_columns)
+                        .with_format("arrow")
+                    )
             self._opened_pid = os.getpid()
         return r
 

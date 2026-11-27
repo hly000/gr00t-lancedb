@@ -211,6 +211,10 @@ def make_bench_callback(
             for k in ("imports_s", "dataset_build_s", "trainer_init_s", "dataloader_create_s", "mp_ctx"):
                 if k in phases:
                     rec[k] = phases[k]
+            if os.environ.get("GR00T_LANCE_WHERE"):
+                rec["lance_where"] = os.environ["GR00T_LANCE_WHERE"]
+            if os.environ.get("GR00T_LANCE_VERSION"):
+                rec["lance_version"] = int(os.environ["GR00T_LANCE_VERSION"])
             self._write(rec)
             # Mark t_prev_end AFTER writing so callback I/O does not leak into step 1 data_wait_s.
             self.t_prev_end = time.time()
@@ -497,6 +501,10 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
     assert cfg.training.eval_strategy == "no", "Sharded dataset does not support evaluation sets"
     fast = fast_loader_settings(cfg.data.fast_loader)
 
+    lance_where = os.environ.get("GR00T_LANCE_WHERE") or None
+    lance_version_raw = os.environ.get("GR00T_LANCE_VERSION")
+    lance_version = int(lance_version_raw) if lance_version_raw else None
+
     all_datasets, all_weights = [], []
     for spec in cfg.data.datasets:
         emb = spec.embodiment_tag
@@ -513,7 +521,12 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
             )
             if backend == "lance":
                 # Stats were baked into meta.lance at conversion time: no rank-0 parquet scan.
-                group.append(LanceShardedSingleStepDataset(**common))
+                lance_kw = dict(common)
+                if lance_where is not None:
+                    lance_kw["where"] = lance_where
+                if lance_version is not None:
+                    lance_kw["lance_version"] = lance_version
+                group.append(LanceShardedSingleStepDataset(**lance_kw))
             else:
                 with run_or_wait_on_rank0(label=f"generate_stats({path})") as is_rank0:
                     if is_rank0:
@@ -564,8 +577,23 @@ def main() -> None:
     launch_t0 = time.time()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--gr00t-root", default=os.environ.get("GR00T_ROOT", "/data/Isaac-GR00T"))
+    p.add_argument(
+        "--lance-where",
+        default=os.environ.get("GR00T_LANCE_WHERE"),
+        help="Optional SQL WHERE predicate pushed down to frames.lance (e.g. 'is_valid = true').",
+    )
+    p.add_argument(
+        "--lance-version",
+        type=int,
+        default=int(os.environ["GR00T_LANCE_VERSION"]) if os.environ.get("GR00T_LANCE_VERSION") else None,
+        help="Optional Lance frames table version for reproducible time-travel training.",
+    )
     p.add_argument("gr00t_args", nargs=argparse.REMAINDER, help="Arguments after `--` go to launch_finetune.py")
     args = p.parse_args()
+    if args.lance_where:
+        os.environ["GR00T_LANCE_WHERE"] = args.lance_where
+    if args.lance_version is not None:
+        os.environ["GR00T_LANCE_VERSION"] = str(args.lance_version)
     gr00t_args = args.gr00t_args[1:] if args.gr00t_args[:1] == ["--"] else args.gr00t_args
 
     backend = os.environ.get("GR00T_DATA_BACKEND", "native").lower()

@@ -4,6 +4,7 @@
 #
 #   BACKEND=native DATASET=/data/datasets/libero_10      OUT=/data/runs/native bash scripts/run_gr00t_finetune.sh
 #   BACKEND=lance  DATASET=/data/datasets/libero_10_lance OUT=/data/runs/lance  bash scripts/run_gr00t_finetune.sh
+#   BACKEND=lance  GR00T_LANCE_WHERE="is_valid = true" DATASET=... OUT=... bash scripts/run_gr00t_finetune.sh
 #   BACKEND=native-exact ...   (GR00T data + exact-resume loader, no Lance)
 #
 # Extra launch_finetune.py flags can be appended after the script name.
@@ -33,6 +34,12 @@ if [ -n "${S3_ENV_FILE:-}" ]; then
 fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export GR00T_DATA_BACKEND="$BACKEND"
+if [ -n "${LANCE_WHERE:-}" ]; then
+  export GR00T_LANCE_WHERE="${GR00T_LANCE_WHERE:-$LANCE_WHERE}"
+fi
+if [ -n "${LANCE_VERSION:-}" ]; then
+  export GR00T_LANCE_VERSION="${GR00T_LANCE_VERSION:-$LANCE_VERSION}"
+fi
 # Resuming loads optimizer state on top of a ~39 GB working set on a 40 GB A100; without
 # this, fragmentation OOMs the resume (both backends).
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
