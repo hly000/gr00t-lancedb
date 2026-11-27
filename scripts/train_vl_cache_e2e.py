@@ -29,6 +29,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # collation now runs in forked workers
+
 _REPO_SRC = str(Path(__file__).resolve().parents[1] / "src")
 if _REPO_SRC not in sys.path:
     sys.path.insert(0, _REPO_SRC)
@@ -98,22 +100,30 @@ def _build_processor_and_dataset(
 # ---------------------------------------------------------------------------
 
 
-class _AnchorBatchDataset(Dataset):
-    """Worker-parallel decoder for fast backbone feature materialization."""
+_BACKBONE_KEYS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+_SCALAR_KEYS = ("state", "action", "action_mask", "embodiment_id")
 
-    def __init__(self, ds: Any, processor: Any, anchors: list[tuple[int, int]], chunk_size: int = 32) -> None:
+
+class _AnchorBatchDataset(Dataset):
+    """Decode, preprocess AND collate in the worker; the main thread only feeds the GPU."""
+
+    def __init__(
+        self, ds: Any, processor: Any, collator: Any, anchors: list[tuple[int, int]], chunk_size: int = 32
+    ) -> None:
         self.ds = ds
         self.processor = processor
+        self.collator = collator
         self.chunks = [anchors[i : i + chunk_size] for i in range(0, len(anchors), chunk_size)]
 
     def __len__(self) -> int:
         return len(self.chunks)
 
-    def __getitem__(self, idx: int) -> tuple[list[tuple[int, int]], list[Any]]:
+    def __getitem__(self, idx: int) -> tuple[list[tuple[int, int]], dict[str, Any]]:
         chunk = self.chunks[idx]
         steps = self.ds.load_anchor_batch(chunk)
         proc_items = [self.processor([{"type": "episode_step", "content": s}]) for s in steps]
-        return chunk, proc_items
+        inputs = self.collator(proc_items)["inputs"]
+        return chunk, {k: inputs[k] for k in _BACKBONE_KEYS + _SCALAR_KEYS if k in inputs}
 
 
 def materialize_full_cache(
@@ -129,7 +139,13 @@ def materialize_full_cache(
     reuse_existing: bool = True,
 ) -> dict[str, Any]:
     from transformers import AutoModel
-    from gr00t_lancedb.vl_cache import CacheFingerprint, VLCacheWriter
+    from gr00t_lancedb.vl_cache import (
+        AsyncSink,
+        CacheFingerprint,
+        VLCacheWriter,
+        encode_features_torch,
+        pooled_visual_emb_torch,
+    )
 
     cfg, tag, ds, processor, collator = _build_processor_and_dataset(
         dataset_path=dataset_path,
@@ -183,62 +199,82 @@ def materialize_full_cache(
         flush_rows=1024,
         overwrite=True,
     )
+    sink = AsyncSink(writer.add_encoded_batch, maxsize=4)
 
-    # Pre-allocate compact numpy arrays for scalar action_inputs (tiny: ~60 MB for 100k frames!)
-    states_list: list[np.ndarray] = []
-    actions_list: list[np.ndarray] = []
-    action_masks_list: list[np.ndarray] = []
-    emb_ids_list: list[np.ndarray] = []
-
+    scalars: dict[str, list[np.ndarray]] = {k: [] for k in _SCALAR_KEYS}
     loader = DataLoader(
-        _AnchorBatchDataset(ds, processor, anchors, chunk_size=batch_size),
+        _AnchorBatchDataset(ds, processor, collator, anchors, chunk_size=batch_size),
         batch_size=None,
         num_workers=num_workers,
         prefetch_factor=2 if num_workers > 0 else None,
+        pin_memory=True,
         multiprocessing_context="fork" if num_workers > 0 else None,
     )
 
     t_inf0 = time.perf_counter()
     row_counter = 0
-    for chunk, proc_items in loader:
-        batch = collator(proc_items)["inputs"]
-        states_list.append(batch["state"].to(torch.float16).numpy())
-        actions_list.append(batch["action"].to(torch.float16).numpy())
-        action_masks_list.append(batch["action_mask"].to(torch.bool).numpy())
-        emb_ids_list.append(batch["embodiment_id"].to(torch.int32).numpy())
+    wait_s = gpu_s = 0.0
+    t_prev = time.perf_counter()
+    for chunk, batch in loader:
+        t_got = time.perf_counter()
+        wait_s += t_got - t_prev
+        # fp32 scalars: 4 bytes x ~100 values per frame is nothing next to the features
+        scalars["state"].append(batch["state"].to(torch.float32).numpy())
+        scalars["action"].append(batch["action"].to(torch.float32).numpy())
+        scalars["action_mask"].append(batch["action_mask"].to(torch.bool).numpy())
+        scalars["embodiment_id"].append(batch["embodiment_id"].to(torch.int32).numpy())
 
         bb_in = {
-            k: (v.to(device, dtype=torch.bfloat16) if torch.is_floating_point(v) else v.to(device))
-            for k, v in batch.items()
-            if k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+            k: (
+                batch[k].to(device, dtype=torch.bfloat16, non_blocking=True)
+                if torch.is_floating_point(batch[k])
+                else batch[k].to(device, non_blocking=True)
+            )
+            for k in _BACKBONE_KEYS
+            if k in batch
         }
         with torch.inference_mode():
             out = backbone(bb_in)
-        feats = out.backbone_features.float().cpu().numpy()
-        attn = out.backbone_attention_mask.cpu().numpy()
-        img_m = out.image_mask.cpu().numpy()
-
-        writer.add_batch(
+            feats = out.backbone_features
+            attn = out.backbone_attention_mask.bool()
+            img_m = out.image_mask.bool()
+            # Quantise and pool on the GPU: int8 instead of fp32 crosses PCIe, and the
+            # per-row numpy encode leaves the loop that the GPU waits on.
+            payload, scale = encode_features_torch(feats, codec=codec)
+            pooled = pooled_visual_emb_torch(feats, attn, img_m)
+            host = {
+                "payload": payload.cpu().numpy(),
+                "scale": None if scale is None else scale.cpu().numpy(),
+                "attention_mask": attn.cpu().numpy(),
+                "image_mask": img_m.cpu().numpy(),
+                "pooled": pooled.cpu().numpy(),
+            }
+        sink.put(
             row_keys=list(range(row_counter, row_counter + len(chunk))),
             episode_indices=[ep for ep, _ in chunk],
             frame_indices=[fr for _, fr in chunk],
             view_ids=[0] * len(chunk),
-            features=feats,
-            attention_mask=attn,
-            image_mask=img_m,
+            **host,
         )
         row_counter += len(chunk)
+        t_prev = time.perf_counter()
+        gpu_s += t_prev - t_got
         if row_counter % (batch_size * 20) == 0 or row_counter >= total_frames:
             dt = time.perf_counter() - t_inf0
-            print(f"[materialize] {row_counter}/{total_frames} ({row_counter / max(1e-6, dt):.1f} frames/s, elapsed {dt:.1f}s)", flush=True)
+            print(
+                f"[materialize] {row_counter}/{total_frames} ({row_counter / max(1e-6, dt):.1f} frames/s, "
+                f"elapsed {dt:.1f}s | waiting for decode {wait_s:.0f}s, backbone+encode {gpu_s:.0f}s, "
+                f"writer {sink.busy_s:.0f}s, backlog {sink.max_backlog})",
+                flush=True,
+            )
 
+    sink.close()
     summary = writer.close()
     np.savez(
         scalars_path,
-        state=np.concatenate(states_list, axis=0),
-        action=np.concatenate(actions_list, axis=0),
-        action_mask=np.concatenate(action_masks_list, axis=0),
-        embodiment_id=np.concatenate(emb_ids_list, axis=0),
+        episode_index=np.asarray([ep for ep, _ in anchors], dtype=np.int32),
+        frame_index=np.asarray([fr for _, fr in anchors], dtype=np.int32),
+        **{k: np.concatenate(v, axis=0) for k, v in scalars.items()},
     )
     inf_s = time.perf_counter() - t_inf0
     total_s = time.perf_counter() - t0
@@ -250,6 +286,15 @@ def materialize_full_cache(
             "total_wall_s": round(total_s, 2),
             "frames_per_s": round(row_counter / max(1e-6, inf_s), 2),
             "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+            # Which stage bounds throughput: the largest of these three is the one to fix next.
+            "stage_s": {
+                "waiting_for_decode": round(wait_s, 1),
+                "backbone_and_gpu_encode": round(gpu_s, 1),
+                "writer_thread_busy": round(sink.busy_s, 1),
+            },
+            "writer_max_backlog": sink.max_backlog,
+            "mat_batch_size": batch_size,
+            "mat_workers": num_workers,
         }
     )
     meta_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -277,25 +322,26 @@ class _CachedStepBatchDataset(Dataset):
         batch_size: int,
         num_steps: int,
         seed: int = 42,
+        row_pool: np.ndarray | None = None,
     ) -> None:
+        from gr00t_lancedb.vl_cache.probe import load_scalars
+
         self.cache_dir = cache_dir
         self.table_name = table_name
         self.batch_size = int(batch_size)
         self.num_steps = int(num_steps)
-
-        npz = np.load(scalars_path)
-        self.state = npz["state"]
-        self.action = npz["action"]
-        self.action_mask = npz["action_mask"]
-        self.embodiment_id = npz["embodiment_id"]
-        self.n_rows = int(self.state.shape[0])
+        self.scalars = load_scalars(scalars_path)
+        self.n_rows = int(self.scalars["state"].shape[0])
+        pool = np.arange(self.n_rows, dtype=np.int64) if row_pool is None else np.asarray(row_pool, dtype=np.int64)
 
         # Deterministic epoch-shuffled indices covering num_steps * batch_size
         rng = np.random.default_rng(seed)
         needed = self.num_steps * self.batch_size
         chunks: list[np.ndarray] = []
-        while sum(len(c) for c in chunks) < needed:
-            chunks.append(rng.permutation(self.n_rows))
+        have = 0
+        while have < needed:
+            chunks.append(pool[rng.permutation(len(pool))])
+            have += len(pool)
         self.schedule = np.concatenate(chunks)[:needed].reshape(self.num_steps, self.batch_size)
         self._reader: Any = None
 
@@ -311,37 +357,23 @@ class _CachedStepBatchDataset(Dataset):
         return self.num_steps
 
     def __getitem__(self, step_idx: int) -> dict[str, Any]:
-        from gr00t_lancedb.vl_cache import collate_cached_vl_batch
+        from gr00t_lancedb.vl_cache.probe import load_cached_batch
 
-        row_ids = self.schedule[step_idx].tolist()
-        reader = self._get_reader()
-        rows = reader.take_rows(row_ids)
-        vl = collate_cached_vl_batch(
-            rows,
-            codec=reader.fingerprint.quant_codec,
-            pad_side=reader.fingerprint.pad_side,
-            dequantize_on_cpu=False,
-            device=None,
-        )
-        idx = np.asarray(row_ids, dtype=np.int64)
-        vl["state"] = torch.from_numpy(self.state[idx])
-        vl["action"] = torch.from_numpy(self.action[idx])
-        vl["action_mask"] = torch.from_numpy(self.action_mask[idx])
-        vl["embodiment_id"] = torch.from_numpy(self.embodiment_id[idx].astype(np.int64))
-        return vl
+        return load_cached_batch(self._get_reader(), self.scalars, self.schedule[step_idx].tolist())
 
 
 def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> dict[str, Any]:
-    from transformers import BatchFeature
     from gr00t_lancedb.vl_cache import (
         FeatureSpaceAugmenter,
         build_action_head_optimizer,
-        dequantize_features_torch,
         export_merged_gr00t_checkpoint,
+        head_inputs_from_cached,
         load_action_head_only,
         patch_action_head_multi_noise,
+        probe_fm_loss,
         save_action_head_checkpoint,
     )
+    from gr00t_lancedb.vl_cache.probe import prepare_probe_isolated
 
     device = "cuda"
     torch.manual_seed(args.seed)
@@ -374,6 +406,22 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
     aug = FeatureSpaceAugmenter(token_dropout=args.token_dropout, gaussian_jitter=args.gaussian_jitter)
 
     frames_per_step = max(1, args.batch_size // max(1, args.multi_noise))
+    # Whole episodes are held out for the probe; the split is rebuilt identically by
+    # eval_cached_fm_loss.py from (holdout_frac, holdout_seed). Runs in a spawned child so this
+    # process has not touched Lance when the DataLoader forks.
+    probe = prepare_probe_isolated(
+        args.cache_dir,
+        mat_summary["table_name"],
+        mat_summary["scalars_path"],
+        args.holdout_frac,
+        args.holdout_seed,
+        args.probe_rows,
+    )
+    print(
+        f"[train] rows: {len(probe['train_rows'])} train / {len(probe['probe_rows'])} probe "
+        f"({probe['held_out_episodes']} held-out episodes)",
+        flush=True,
+    )
     ds = _CachedStepBatchDataset(
         cache_dir=args.cache_dir,
         table_name=mat_summary["table_name"],
@@ -381,7 +429,35 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         batch_size=frames_per_step,
         num_steps=args.max_steps,
         seed=args.seed,
+        row_pool=probe["train_rows"],
     )
+    # The native trainer feeds fp32 state/action and lets autocast cast inside each layer.
+    # With bf16 weights an op outside autocast's cast list could reject the dtype mix, so try it
+    # once up front and fall back to parameter-dtype inputs (recorded in the summary) if it does.
+    scalar_dtype = torch.float32
+    try:
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            ah(*head_inputs_from_cached(probe["probe_batches"][0], device, scalar_dtype=scalar_dtype))
+    except RuntimeError as exc:
+        if param_dtype == torch.float32:
+            raise
+        print(f"[train] WARNING: fp32 inputs rejected by the bf16 head ({exc}); using bf16 inputs", flush=True)
+        scalar_dtype = param_dtype
+
+    probe_curve: list[dict[str, Any]] = []
+    probe_s = 0.0
+
+    def _run_probe(step: int) -> None:
+        nonlocal probe_s
+        t_p = time.perf_counter()
+        rec = probe_fm_loss(
+            ah, probe["probe_batches"], device=device, amp_dtype=torch.bfloat16, scalar_dtype=scalar_dtype
+        )
+        probe_s += time.perf_counter() - t_p
+        rec["step"] = step
+        probe_curve.append(rec)
+        print(f"[train] probe @ {step}: {rec['probe_loss']:.5f} +- {rec['probe_sem']:.5f}", flush=True)
+
     loader = DataLoader(
         ds,
         batch_size=None,
@@ -403,27 +479,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
     t_loop0 = time.perf_counter()
     for step, batch in enumerate(loader):
         t_s0 = time.perf_counter()
-        codec = batch["quant_codec"]
-        pl_gpu = batch["feat_payload"].to(device, non_blocking=True)
-        sc_gpu = batch["feat_scale"].to(device, non_blocking=True) if batch["feat_scale"] is not None else None
-        feats_gpu = dequantize_features_torch(pl_gpu, sc_gpu, codec=codec, target_dtype=torch.bfloat16)
-
-        bb_out = BatchFeature(
-            data={
-                "backbone_features": feats_gpu,
-                "backbone_attention_mask": batch["backbone_attention_mask"].to(device, non_blocking=True),
-                "image_mask": batch["image_mask"].to(device, non_blocking=True),
-            }
-        )
+        bb_out, act_in = head_inputs_from_cached(batch, device, scalar_dtype=scalar_dtype)
         bb_out = aug(bb_out, training=True)
-        act_in = BatchFeature(
-            data={
-                "state": batch["state"].to(device, dtype=torch.bfloat16, non_blocking=True),
-                "action": batch["action"].to(device, dtype=torch.bfloat16, non_blocking=True),
-                "action_mask": batch["action_mask"].to(device, dtype=torch.bfloat16, non_blocking=True),
-                "embodiment_id": batch["embodiment_id"].to(device, non_blocking=True),
-            }
-        )
 
         opt.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -445,6 +502,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         loss_val = float(loss.item())
         losses.append(loss_val)
 
+        if args.probe_every > 0 and ((step + 1) % args.probe_every == 0 or step + 1 == args.max_steps):
+            _run_probe(step + 1)
         if (step + 1) % 250 == 0 or step == 0 or step + 1 == args.max_steps:
             med_ms = float(np.median(step_times[-100:])) * 1000.0 if step_times else dt * 1000.0
             avg_loss = float(np.mean(losses[-50:]))
@@ -508,6 +567,14 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         "peak_alloc_gb": peak_alloc_gb,
         "peak_reserved_gb": peak_resv_gb,
         "final_loss_mean50": round(float(np.mean(losses[-50:])), 5),
+        "input_dtype": str(scalar_dtype).replace("torch.", ""),
+        "holdout_frac": args.holdout_frac,
+        "holdout_seed": args.holdout_seed,
+        "train_rows": int(len(probe["train_rows"])),
+        "probe_rows": int(len(probe["probe_rows"])),
+        "probe_curve": probe_curve,
+        "final_probe_loss": probe_curve[-1]["probe_loss"] if probe_curve else None,
+        "probe_total_s": round(probe_s, 2),
         "save_action_head_s": round(save_s, 2),
         "export_merged_s": round(export_s, 2),
         "merged_checkpoint_dir": str(merged_dir),
@@ -526,7 +593,7 @@ def main() -> None:
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--codec", default="per_token_int8")
-    p.add_argument("--mat-batch-size", type=int, default=64)
+    p.add_argument("--mat-batch-size", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--multi-noise", type=int, default=1)
     p.add_argument("--max-steps", type=int, default=3000)
@@ -545,6 +612,11 @@ def main() -> None:
     )
     p.add_argument("--compile", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--mat-workers", type=int, default=8, help="decode/preprocess workers for materialisation")
+    p.add_argument("--holdout-frac", type=float, default=0.03, help="fraction of episodes kept out of training")
+    p.add_argument("--holdout-seed", type=int, default=0)
+    p.add_argument("--probe-rows", type=int, default=1024)
+    p.add_argument("--probe-every", type=int, default=500, help="steps between probe evaluations; 0 disables")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-frames", type=int, default=0)
     args = p.parse_args()
@@ -557,7 +629,7 @@ def main() -> None:
         cache_dir=args.cache_dir,
         codec=args.codec,
         batch_size=args.mat_batch_size,
-        num_workers=args.num_workers,
+        num_workers=args.mat_workers,
         max_frames=args.max_frames,
     )
     train_and_export(args, mat_summary)

@@ -107,6 +107,35 @@ class VLCacheWriter:
             self._db = lancedb.connect(self.db_uri, **kwargs)
         return self._db
 
+    def _append_row(
+        self,
+        *,
+        row_key: int,
+        episode_index: int,
+        frame_index: int,
+        view_id: int,
+        seq_len: int,
+        img_bytes: bytes,
+        scale_bytes: bytes,
+        payload_bytes: bytes,
+        pooled: np.ndarray | None,
+    ) -> None:
+        self._buf["row_key"].append(int(row_key))
+        self._buf["episode_index"].append(int(episode_index))
+        self._buf["frame_index"].append(int(frame_index))
+        self._buf["view_id"].append(int(view_id))
+        self._buf["seq_len"].append(int(seq_len))
+        self._buf["image_mask"].append(img_bytes)
+        self._buf["feat_scale"].append(scale_bytes)
+        self._buf["feat_payload"].append(payload_bytes)
+        if self.include_pooled_emb:
+            if pooled is None:
+                raise ValueError("pooled embedding required: writer was built with include_pooled_emb=True")
+            self._buf["pooled_visual_emb"].append(np.asarray(pooled, dtype=np.float32))
+        self.payload_bytes_written += len(payload_bytes) + len(scale_bytes) + len(img_bytes)
+        if len(self._buf["row_key"]) >= self.flush_rows:
+            self.flush()
+
     def add_sample(
         self,
         *,
@@ -120,24 +149,54 @@ class VLCacheWriter:
     ) -> None:
         """Strip padding, compress, and buffer one frame's VLM output."""
         valid_feat, valid_img, _ = strip_padding(features, attention_mask, image_mask)
-        seq_len = int(valid_feat.shape[0])
         scale_bytes, payload_bytes = encode_features(valid_feat, codec=self.fingerprint.quant_codec)
-        img_bytes = pack_bool_mask(valid_img)
+        self._append_row(
+            row_key=row_key,
+            episode_index=episode_index,
+            frame_index=frame_index,
+            view_id=view_id,
+            seq_len=int(valid_feat.shape[0]),
+            img_bytes=pack_bool_mask(valid_img),
+            scale_bytes=scale_bytes,
+            payload_bytes=payload_bytes,
+            pooled=compute_pooled_visual_emb(valid_feat, valid_img) if self.include_pooled_emb else None,
+        )
 
-        self._buf["row_key"].append(int(row_key))
-        self._buf["episode_index"].append(int(episode_index))
-        self._buf["frame_index"].append(int(frame_index))
-        self._buf["view_id"].append(int(view_id))
-        self._buf["seq_len"].append(seq_len)
-        self._buf["image_mask"].append(img_bytes)
-        self._buf["feat_scale"].append(scale_bytes)
-        self._buf["feat_payload"].append(payload_bytes)
-        if self.include_pooled_emb:
-            self._buf["pooled_visual_emb"].append(compute_pooled_visual_emb(valid_feat, valid_img))
+    def add_encoded_batch(
+        self,
+        *,
+        row_keys: Sequence[int],
+        episode_indices: Sequence[int],
+        frame_indices: Sequence[int],
+        view_ids: Sequence[int],
+        payload: np.ndarray,
+        scale: np.ndarray | None,
+        attention_mask: np.ndarray,
+        image_mask: np.ndarray,
+        pooled: np.ndarray | None = None,
+    ) -> None:
+        """Buffer a batch already encoded by ``encode_features_torch`` (padding still present).
 
-        self.payload_bytes_written += len(payload_bytes) + len(scale_bytes) + len(img_bytes)
-        if len(self._buf["row_key"]) >= self.flush_rows:
-            self.flush()
+        ``payload`` is ``[B, T, D]`` int8 (or int16/uint16 bf16 bits), ``scale`` ``[B, T]`` fp16
+        or ``None``, masks ``[B, T]`` bool, ``pooled`` ``[B, D]`` fp32.
+        """
+        attn = np.asarray(attention_mask, dtype=bool)
+        img = np.asarray(image_mask, dtype=bool)
+        if self.fingerprint.quant_codec == "bf16_raw":
+            payload = np.asarray(payload).view(np.uint16)
+        for i in range(len(row_keys)):
+            m = attn[i]
+            self._append_row(
+                row_key=row_keys[i],
+                episode_index=episode_indices[i],
+                frame_index=frame_indices[i],
+                view_id=view_ids[i],
+                seq_len=int(m.sum()),
+                img_bytes=pack_bool_mask(img[i][m]),
+                scale_bytes=b"" if scale is None else np.ascontiguousarray(scale[i][m]).tobytes(),
+                payload_bytes=np.ascontiguousarray(payload[i][m]).tobytes(),
+                pooled=None if pooled is None else pooled[i],
+            )
 
     def add_batch(
         self,
@@ -202,6 +261,63 @@ class VLCacheWriter:
             "payload_bytes_written": self.payload_bytes_written,
             "avg_bytes_per_row": (self.payload_bytes_written / self.rows_written) if self.rows_written else 0.0,
         }
+
+
+class AsyncSink:
+    """Run ``fn(**item)`` for queued items on one background thread, in order.
+
+    ``put`` blocks once ``maxsize`` items are waiting, so a slow consumer applies back-pressure
+    instead of growing memory. An exception in ``fn`` is re-raised by the next ``put`` or by
+    ``close`` - never swallowed.
+    """
+
+    def __init__(self, fn: Any, maxsize: int = 4) -> None:
+        import queue
+        import threading
+
+        self._fn = fn
+        self._q: Any = queue.Queue(maxsize=maxsize)
+        self._err: BaseException | None = None
+        self.busy_s = 0.0
+        self.max_backlog = 0
+        # Started on the first put(): a DataLoader created in between forks its workers from a
+        # single-threaded parent.
+        self._thread = threading.Thread(target=self._run, name="vl-cache-writer", daemon=True)
+        self._started = False
+
+    def _run(self) -> None:
+        import time
+
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            if self._err is not None:
+                continue  # drain so the producer never blocks forever
+            try:
+                t0 = time.perf_counter()
+                self._fn(**item)
+                self.busy_s += time.perf_counter() - t0
+            except BaseException as exc:  # noqa: BLE001 - handed to the producer thread
+                self._err = exc
+
+    def _check(self) -> None:
+        if self._err is not None:
+            raise RuntimeError("background writer failed") from self._err
+
+    def put(self, **item: Any) -> None:
+        if not self._started:
+            self._started = True
+            self._thread.start()
+        self._check()
+        self.max_backlog = max(self.max_backlog, self._q.qsize())
+        self._q.put(item)
+
+    def close(self) -> None:
+        if self._started:
+            self._q.put(None)
+            self._thread.join()
+        self._check()
 
 
 @dataclass

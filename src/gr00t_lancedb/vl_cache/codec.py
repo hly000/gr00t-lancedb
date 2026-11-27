@@ -180,6 +180,39 @@ def encode_features(
     raise ValueError(f"Unknown quant_codec: {codec!r}")
 
 
+def encode_features_torch(features: Any, codec: QuantCodec = "per_token_int8") -> tuple[Any, Any | None]:
+    """Encode ``[..., T, D]`` features on their own device: ``(payload, scale | None)``.
+
+    Bit-identical to :func:`encode_features` (same fp32 arithmetic, fp16 scales, round-half-even)
+    so a cache written through this path has the same fingerprint and the same bytes. Doing it
+    on the GPU moves int8 instead of fp32 across PCIe and takes the per-row numpy work off the
+    materialisation loop.
+    """
+    import torch
+
+    if codec == "per_token_int8":
+        f32 = features.to(torch.float32)
+        scale16 = (f32.abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1e-6).to(torch.float16)
+        q = torch.round(f32 / scale16.to(torch.float32)).clamp_(-127, 127).to(torch.int8)
+        return q, scale16.squeeze(-1)
+    if codec == "bf16_raw":
+        return features.to(torch.bfloat16).contiguous().view(torch.int16), None
+    raise ValueError(f"Unknown quant_codec: {codec!r}")
+
+
+def pooled_visual_emb_torch(features: Any, attention_mask: Any, image_mask: Any) -> Any:
+    """Batched :func:`compute_pooled_visual_emb`: ``[B, T, D]`` -> L2-normalised ``[B, D]`` fp32."""
+    import torch
+
+    attn = attention_mask.bool()
+    sel = attn & image_mask.bool()
+    sel = torch.where(sel.any(dim=1, keepdim=True), sel, attn)
+    w = sel.unsqueeze(-1).to(torch.float32)
+    pooled = (features.to(torch.float32) * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+    norm = pooled.norm(dim=-1, keepdim=True)
+    return torch.where(norm > 1e-8, pooled / norm.clamp_min(1e-30), pooled)
+
+
 def decode_features_numpy(
     scale_bytes: bytes,
     payload_bytes: bytes,

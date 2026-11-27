@@ -30,13 +30,23 @@ from .codec import (
     decode_features_numpy,
     dequantize_features_torch,
     encode_features,
+    encode_features_torch,
     pack_bool_mask,
+    pooled_visual_emb_torch,
     strip_padding,
     unpack_bool_mask,
 )
-from .store import VLCacheReader, VLCacheWriter, collate_cached_vl_batch
+from .probe import build_probe_batches, head_inputs_from_cached, probe_fm_loss, split_holdout_rows
+from .store import AsyncSink, VLCacheReader, VLCacheWriter, collate_cached_vl_batch
 
 __all__ = [
+    "AsyncSink",
+    "build_probe_batches",
+    "encode_features_torch",
+    "head_inputs_from_cached",
+    "pooled_visual_emb_torch",
+    "probe_fm_loss",
+    "split_holdout_rows",
     "CACHE_META_KEY",
     "VL_CACHE_FORMAT",
     "CacheFingerprint",
