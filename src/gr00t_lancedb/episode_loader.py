@@ -127,6 +127,11 @@ if hasattr(os, "register_at_fork"):
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    try:
+        if path.read_bytes() == data:
+            return
+    except OSError:
+        pass
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_bytes(data)

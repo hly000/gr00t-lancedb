@@ -84,7 +84,8 @@ _PRELOAD: dict[str, Any] = {"thread": None, "error": None, "wall_s": None}
 # Modules a DataLoader worker needs on its first read. Importing them is fork-safe (no
 # Tokio runtime starts until a table is opened); having them in the parent before fork
 # means every forked worker inherits them instead of paying ~2-3 s on the first batch.
-_PRELOAD_MODULES = ("lerobot_lancedb", "lancedb.permutation", "torchcodec.decoders")
+# torchcodec is deliberately left to the workers (as in the validated train-perf setup).
+_PRELOAD_MODULES = ("lerobot_lancedb", "lancedb.permutation")
 
 
 def preload_lance_stack(background: bool = True) -> threading.Thread | None:
