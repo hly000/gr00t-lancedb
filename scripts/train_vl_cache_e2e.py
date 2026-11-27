@@ -349,7 +349,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
     torch.cuda.reset_peak_memory_stats()
 
     t_train_start = time.perf_counter()
-    ah, cfg, _ = load_action_head_only(args.base_model_path, device=device, dtype=torch.bfloat16)
+    param_dtype = torch.float32 if args.fp32_master_weights else torch.bfloat16
+    ah, cfg, _ = load_action_head_only(args.base_model_path, device=device, dtype=param_dtype)
     ah.state_dropout_prob = args.state_dropout_prob
     ah.train()
     if args.multi_noise > 1:
@@ -422,7 +423,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         )
 
         opt.zero_grad(set_to_none=True)
-        loss = ah(bb_out, act_in)["loss"]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            loss = ah(bb_out, act_in)["loss"]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(ah.parameters(), 1.0)
         opt.step()
@@ -522,8 +524,9 @@ def main() -> None:
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--state-dropout-prob", type=float, default=0.2)
-    p.add_argument("--token-dropout", type=float, default=0.05)
-    p.add_argument("--gaussian-jitter", type=float, default=0.01)
+    p.add_argument("--token-dropout", type=float, default=0.0)
+    p.add_argument("--gaussian-jitter", type=float, default=0.0)
+    p.add_argument("--fp32-master-weights", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
