@@ -67,11 +67,11 @@ def _load_real_batches(
     import torch
     from transformers import AutoConfig
     from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
-    from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator, Gr00tN1d7Processor
+    from gr00t_lancedb._gr00t_compat import coerce_embodiment_tag
 
     cfg = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
-    tag = EmbodimentTag(embodiment_tag) if not isinstance(embodiment_tag, EmbodimentTag) else embodiment_tag
+    tag = coerce_embodiment_tag(embodiment_tag)
     modality_configs = MODALITY_CONFIGS[tag.value]
 
     processor = Gr00tN1d7Processor(
@@ -441,9 +441,9 @@ def cmd_materialize(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     from transformers import AutoConfig, AutoModel
     from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
-    from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator, Gr00tN1d7Processor
     from gr00t_lancedb import LanceShardedSingleStepDataset
+    from gr00t_lancedb._gr00t_compat import coerce_embodiment_tag
     from gr00t_lancedb.vl_cache import CacheFingerprint, VLCacheWriter
 
     _add_gr00t_root(args.gr00t_root)
@@ -451,7 +451,7 @@ def cmd_materialize(args: argparse.Namespace) -> dict[str, Any]:
     t_start = time.perf_counter()
 
     cfg = AutoConfig.from_pretrained(args.base_model_path, trust_remote_code=True)
-    tag = EmbodimentTag(args.embodiment_tag)
+    tag = coerce_embodiment_tag(args.embodiment_tag)
     modality_configs = MODALITY_CONFIGS[tag.value]
 
     ds = LanceShardedSingleStepDataset(
