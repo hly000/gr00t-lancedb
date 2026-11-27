@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import time
 
-from lerobot_lancedb import lance_mp_context
+from .._isolated import lance_mp_context
 
 from .._gr00t_compat import ModalityConfig
 from ..resumable_mixture import ResumableLanceMixtureDataset

@@ -20,7 +20,7 @@ from ._gr00t_compat import (
     VLAStepData,
     coerce_embodiment_tag,
 )
-from .episode_loader import LanceEpisodeLoader
+from .episode_loader import DEFAULT_VIDEO_DECODER_CACHE_SIZE, LanceEpisodeLoader
 
 
 class LanceShardedSingleStepDataset(ShardedDataset):
@@ -50,7 +50,12 @@ class LanceShardedSingleStepDataset(ShardedDataset):
         revision: str | None = None,
         token: str | bool | None = None,
         use_mini_mp4: bool = True,
-        video_decoder_cache_size: int = 16,
+        video_decoder_cache_size: int = DEFAULT_VIDEO_DECODER_CACHE_SIZE,
+        where: str | None = None,
+        lance_version: int | None = None,
+        video_cache_dir: str | Path | None = None,
+        video_cache_gb: float | None = None,
+        video_cache_force_local: bool | None = None,
     ) -> None:
         super().__init__(str(dataset_path))
         self.embodiment_tag = coerce_embodiment_tag(embodiment_tag)
@@ -59,6 +64,8 @@ class LanceShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = float(episode_sampling_rate)
         self.seed = int(seed)
         self.allow_padding = bool(allow_padding)
+        self.where = where
+        self.lance_version = lance_version
         self.processor = None
         self.rng = np.random.default_rng(self.seed)
 
@@ -76,6 +83,11 @@ class LanceShardedSingleStepDataset(ShardedDataset):
             token=token,
             use_mini_mp4=use_mini_mp4,
             video_decoder_cache_size=video_decoder_cache_size,
+            where=where,
+            lance_version=lance_version,
+            video_cache_dir=video_cache_dir,
+            video_cache_gb=video_cache_gb,
+            video_cache_force_local=video_cache_force_local,
         )
         # Keep validated modality configs from the loader (handles multi-language truncation, etc.)
         self.modality_configs = self.episode_loader.modality_configs
@@ -88,17 +100,28 @@ class LanceShardedSingleStepDataset(ShardedDataset):
         original_length = self.episode_loader.get_episode_length(episode_index)
         return max(0, original_length - self.action_horizon + 1)
 
+    def get_valid_steps_for_episode(self, episode_index: int) -> np.ndarray:
+        """Return sorted valid anchor ``frame_index`` values for ``episode_index``.
+
+        When ``where`` is active, intersects ``[0, get_effective_episode_length(episode_index))``
+        with the frame indices matching the SQL predicate while preserving full episode temporal
+        continuity for action horizons and video ``delta_indices``.
+        """
+        eff_len = self.get_effective_episode_length(episode_index)
+        return self.episode_loader.get_valid_steps_for_episode(
+            episode_index, max_step_exclusive=eff_len
+        )
+
     def get_all_valid_anchors(self) -> list[tuple[int, int]]:
         """Return every valid ``(ep_idx, step_index)`` pair in deterministic order."""
         anchors: list[tuple[int, int]] = []
         for ep_idx in range(len(self.episode_loader)):
-            eff_len = self.get_effective_episode_length(ep_idx)
-            for step_idx in range(eff_len):
-                anchors.append((ep_idx, step_idx))
+            for step_idx in self.get_valid_steps_for_episode(ep_idx):
+                anchors.append((ep_idx, int(step_idx)))
         return anchors
 
     def shard_dataset(self) -> None:
-        """Mirror ``ShardedSingleStepDataset.shard_dataset`` exactly."""
+        """Mirror ``ShardedSingleStepDataset.shard_dataset`` with optional SQL anchor filtering."""
         shuffled_episode_indices = self.rng.permutation(len(self.episode_loader.episode_lengths))
         num_splits = max(1, int(1 / self.episode_sampling_rate))
 
@@ -108,7 +131,9 @@ class LanceShardedSingleStepDataset(ShardedDataset):
         episode_splits: list[tuple[int, np.ndarray]] = []
         total_steps = 0
         for ep_idx in shuffled_episode_indices:
-            step_indices = np.arange(0, self.get_effective_episode_length(int(ep_idx)))
+            step_indices = self.get_valid_steps_for_episode(int(ep_idx)).copy()
+            if len(step_indices) == 0:
+                continue
             self.rng.shuffle(step_indices)
             total_steps += len(step_indices)
             for i in range(num_splits):
@@ -182,6 +207,18 @@ class LanceShardedSingleStepDataset(ShardedDataset):
 
     def get_initial_actions(self) -> list[dict[str, Any]]:
         return self.episode_loader.get_initial_actions()
+
+    @property
+    def frames_version(self) -> int | None:
+        """MVCC snapshot of ``frames.lance`` this dataset is pinned to (``None`` = latest)."""
+        return self.episode_loader.frames_version
+
+    @property
+    def is_open(self) -> bool:
+        return self.episode_loader.is_open
+
+    def assert_unopened(self) -> None:
+        self.episode_loader.assert_unopened()
 
     def close(self) -> None:
         self.episode_loader.close()

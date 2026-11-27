@@ -1,0 +1,86 @@
+{
+  "dataset": "s3://alignd-7fb6a-groot-stream/libero_10_lance",
+  "access_pattern": "gr00t_fast_sharded_mixture",
+  "anchors": 95784,
+  "dataset_build_s": 5.92,
+  "config": {
+    "batch_size": 32,
+    "num_workers": 4,
+    "first_decode_batch": 32,
+    "steady_decode_batch": 128,
+    "decoder_cache": 64,
+    "video_cache_gb": 20.0,
+    "where": null
+  },
+  "torch": "2.9.0+cu128",
+  "epochs": [
+    {
+      "epoch": 0,
+      "samples": 8000,
+      "wall_s": 37.5,
+      "first_batch_s": 3.44,
+      "samples_per_s": 213.4,
+      "lance_ranges_per_sample": 1.5648,
+      "lance_kb_per_sample": 19.63,
+      "requested_kb_per_sample": 24.19,
+      "frames_takes_per_sample": 0.0094,
+      "gop_cache_hit_rate": 0.178,
+      "peak_mem": {
+        "rss_tree_mb": 19158.3,
+        "pss_tree_mb": 19156.3,
+        "procs": 5.0
+      },
+      "io": {
+        "lance_blob_calls": 72,
+        "lance_blob_ranges": 12518,
+        "lance_blob_bytes": 160791608,
+        "lance_handle_reads": 0,
+        "lance_handle_bytes": 0,
+        "requested_ranges": 14400,
+        "requested_bytes": 198203576,
+        "gop_cache_hits": 6111,
+        "gop_cache_misses": 28229,
+        "gop_cache_hit_bytes": 30667636,
+        "gop_cache_miss_bytes": 162562061,
+        "gop_cache_evictions": 0,
+        "gop_cache_evicted_bytes": 0,
+        "frames_take_calls": 75,
+        "frames_take_rows": 138206
+      }
+    },
+    {
+      "epoch": 1,
+      "samples": 8000,
+      "wall_s": 24.22,
+      "first_batch_s": 3.2,
+      "samples_per_s": 330.3,
+      "lance_ranges_per_sample": 0.4256,
+      "lance_kb_per_sample": 5.75,
+      "requested_kb_per_sample": 23.73,
+      "frames_takes_per_sample": 0.0091,
+      "gop_cache_hit_rate": 0.7534,
+      "peak_mem": {
+        "rss_tree_mb": 19213.6,
+        "pss_tree_mb": 19208.2,
+        "procs": 5.0
+      },
+      "io": {
+        "lance_blob_calls": 69,
+        "lance_blob_ranges": 3405,
+        "lance_blob_bytes": 47143357,
+        "lance_handle_reads": 0,
+        "lance_handle_bytes": 0,
+        "requested_ranges": 13611,
+        "requested_bytes": 194357928,
+        "gop_cache_hits": 25465,
+        "gop_cache_misses": 8335,
+        "gop_cache_hit_bytes": 140660527,
+        "gop_cache_miss_bytes": 47989464,
+        "gop_cache_evictions": 0,
+        "gop_cache_evicted_bytes": 0,
+        "frames_take_calls": 73,
+        "frames_take_rows": 133922
+      }
+    }
+  ]
+}

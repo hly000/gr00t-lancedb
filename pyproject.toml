@@ -35,10 +35,14 @@ s3 = ["boto3>=1.28"]
 gcs = ["gcsfs>=2024.2"]
 cloud = ["boto3>=1.28", "gcsfs>=2024.2"]
 dev = ["pytest>=8.0", "moto[server]>=5.0", "av>=12.0"]
+vision = ["transformers>=4.40"]
+plots = ["matplotlib>=3.7"]
 
 [project.scripts]
 gr00t-lance-convert = "gr00t_lancedb.convert:main_convert"
 gr00t-lance-attach = "gr00t_lancedb.convert:main_attach"
+gr00t-lance-curate = "gr00t_lancedb.curate:main_curate"
+gr00t-lance-vector-curate = "gr00t_lancedb.vector_curate:main_vector_curate"
 gr00t-spot-bench = "gr00t_lancedb.bench.cli:main"
 
 [tool.setuptools.packages.find]

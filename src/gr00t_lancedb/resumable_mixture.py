@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from lerobot_lancedb import lance_mp_context
+from ._isolated import lance_mp_context
 
 from ._gr00t_compat import BaseProcessor
 from .metadata import merge_statistics
@@ -98,6 +98,7 @@ def _lazy_episode_pool_anchors(
     dataset_index: int,
     shard_salt: int = 0,
     strategy: str = "remaining",
+    valid_steps_per_ep: list[np.ndarray] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Lazily yield every valid ``(ep_idx, step_idx)`` in ``episodes`` exactly once in O(pool_size) RAM."""
     valid_eps = [ep for ep in episodes if episode_lengths[ep] > 0]
@@ -114,7 +115,10 @@ def _lazy_episode_pool_anchors(
     while resident_eps or pending:
         while pending and len(resident_eps) < pool_size:
             ep = pending.popleft()
-            steps = rng.permutation(episode_lengths[ep]).tolist()
+            if valid_steps_per_ep is not None:
+                steps = [int(s) for s in rng.permutation(valid_steps_per_ep[ep])]
+            else:
+                steps = rng.permutation(episode_lengths[ep]).tolist()
             resident_eps.append(ep)
             resident_steps.append(steps)
             total_rem += len(steps)
@@ -215,10 +219,20 @@ class ResumableLanceMixtureDataset(IterableDataset):
         self.infinite = bool(infinite)
         self.override_pretraining_statistics = bool(override_pretraining_statistics)
 
-        self._ds_ep_lengths: list[list[int]] = [
-            [ds.get_effective_episode_length(ep) for ep in range(len(ds.episode_loader))]
-            for ds in datasets
-        ]
+        self._ds_valid_steps: list[list[np.ndarray] | None] = []
+        self._ds_ep_lengths: list[list[int]] = []
+        for ds in datasets:
+            if getattr(ds.episode_loader, "valid_steps_by_episode", None) is not None:
+                valid_steps = [
+                    ds.get_valid_steps_for_episode(ep) for ep in range(len(ds.episode_loader))
+                ]
+                self._ds_valid_steps.append(valid_steps)
+                self._ds_ep_lengths.append([len(s) for s in valid_steps])
+            else:
+                self._ds_valid_steps.append(None)
+                self._ds_ep_lengths.append(
+                    [ds.get_effective_episode_length(ep) for ep in range(len(ds.episode_loader))]
+                )
         self._ds_valid_eps: list[list[int]] = [
             [ep for ep, length in enumerate(lens) if length > 0]
             for lens in self._ds_ep_lengths
@@ -440,6 +454,7 @@ class ResumableLanceMixtureDataset(IterableDataset):
         # When episodes are already disjointly sharded across (rank, worker), salt by worker
         # directly; otherwise generate the shared stream and stride disjointly across consumers.
         rank_sharded = self._rank_uses_episode_shards[ds_idx]
+        valid_steps = self._ds_valid_steps[ds_idx]
         if rank_sharded and ep_sharded_workers:
             salt = self.rank * max(1, num_workers) + logical_worker
             yield from _lazy_episode_pool_anchors(
@@ -452,6 +467,7 @@ class ResumableLanceMixtureDataset(IterableDataset):
                 ds_idx,
                 shard_salt=salt,
                 strategy=self.sampling_strategy,
+                valid_steps_per_ep=valid_steps,
             )
             return
 
@@ -466,6 +482,7 @@ class ResumableLanceMixtureDataset(IterableDataset):
                 ds_idx,
                 shard_salt=self.rank,
                 strategy=self.sampling_strategy,
+                valid_steps_per_ep=valid_steps,
             )
             yield from islice(base_iter, logical_worker, None, num_workers)
             return
@@ -481,6 +498,7 @@ class ResumableLanceMixtureDataset(IterableDataset):
             ds_idx,
             shard_salt=0,
             strategy=self.sampling_strategy,
+            valid_steps_per_ep=valid_steps,
         )
         total_consumers = self.world_size * num_workers
         consumer_id = self.rank * num_workers + logical_worker
