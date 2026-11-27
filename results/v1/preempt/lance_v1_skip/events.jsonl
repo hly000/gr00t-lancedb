@@ -1,0 +1,5 @@
+{"t": 1795743417.922001271, "event": "pre_start", "backend": "lance"}
+{"t": 1795743563.551984471, "event": "sigterm", "step": 45, "pid": 2035}
+{"t": 1795743586.120744404, "event": "pre_exit", "code": 143, "last_step": 46}
+{"t": 1795743586.144777118, "event": "resume_start"}
+{"t": 1795743773.125711219, "event": "resume_exit", "code": 0, "last_step": 80}
