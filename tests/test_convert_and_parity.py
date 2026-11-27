@@ -190,3 +190,20 @@ def test_attach_gr00t_meta_on_pure_v3_lance_no_downgrade(
         atol=1e-5,
     )
     loader.close()
+
+
+def test_modality_json_override_leaves_source_untouched(v2_dataset_dir: Path, tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    shutil.copytree(v2_dataset_dir, src)
+    src_modality = src / "meta" / "modality.json"
+    original = src_modality.read_bytes()
+    expected = json.loads(original)
+    expected["state"]["arm_override"] = expected["state"].pop("arm")
+    modality_json = tmp_path / "modality_override.json"
+    modality_json.write_text(json.dumps(expected))
+
+    out = tmp_path / "lance"
+    convert_v2_to_lance(src, out, video_mode="copy", modality_json_path=modality_json)
+
+    assert src_modality.read_bytes() == original
+    assert json.loads((out / "meta" / "modality.json").read_text()) == expected
