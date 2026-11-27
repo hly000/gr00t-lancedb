@@ -16,11 +16,12 @@ import random
 import threading
 from typing import Any
 
+import lancedb
 import numpy as np
 import pandas as pd
 import torch
 
-from lerobot_lancedb import LanceDBDataset
+from lerobot_lancedb import FRAMES_TABLE, LanceDBDataset
 
 from ._gr00t_compat import EmbodimentTag, ModalityConfig, VLAStepData
 # lancedb registers its blob Arrow extension type lazily on first table open; two threads
@@ -108,6 +109,8 @@ class LanceEpisodeLoader:
         use_mini_mp4: bool = True,
         video_decoder_cache_size: int = 16,
         decoder_kwargs: dict[str, Any] | None = None,
+        where: str | None = None,
+        lance_version: int | None = None,
     ) -> None:
         self.dataset_path = str(dataset_path)
         self.repo_id = repo_id
@@ -119,6 +122,8 @@ class LanceEpisodeLoader:
         self.use_mini_mp4 = use_mini_mp4
         self.video_decoder_cache_size = video_decoder_cache_size
         self.decoder_kwargs = decoder_kwargs
+        self.where = where
+        self.lance_version = int(lance_version) if lance_version is not None else None
 
         # Open a lightweight metadata-resolving LanceDBDataset first (no video/frame I/O yet)
         # so remote URIs automatically materialize meta/ from meta.lance once.
@@ -218,6 +223,91 @@ class LanceEpisodeLoader:
             int(ep["episode_index"]): pos for pos, ep in enumerate(self.episodes_metadata)
         }
 
+        # Optional frame-level SQL predicate pushdown against frames.lance (zero video reads).
+        self.valid_steps_by_episode: dict[int, np.ndarray] | None = None
+        if self.where is not None:
+            self.valid_steps_by_episode = self._resolve_valid_steps_from_where(
+                where=self.where,
+                lance_version=self.lance_version,
+            )
+
+    def _open_frames_table(self, lance_version: int | None = None) -> Any:
+        opts = self._reader0._storage_options or self.storage_options
+        db_uri = getattr(self._reader0, "_db_uri", self.dataset_path)
+        db = lancedb.connect(db_uri, storage_options=opts) if opts else lancedb.connect(db_uri)
+        table = db.open_table(FRAMES_TABLE, **({"storage_options": opts} if opts else {}))
+        if lance_version is not None:
+            table.checkout(lance_version)
+        return table
+
+    def _resolve_valid_steps_from_where(
+        self,
+        *,
+        where: str,
+        lance_version: int | None = None,
+    ) -> dict[int, np.ndarray]:
+        """Query ``frames.lance`` projecting ONLY ``["episode_index", "frame_index"]`` with ``where``.
+
+        Builds a per-episode sorted array of matching anchor ``frame_index`` values without
+        touching ``videos.lance`` or breaking full-episode horizon continuity.
+        """
+        with _OPEN_LOCK:
+            table = self._open_frames_table(lance_version=lance_version)
+            arrow_tbl = (
+                table.search()
+                .where(where)
+                .select(["episode_index", "frame_index"])
+                .limit(None)
+                .to_arrow()
+            )
+
+        valid_by_pos: dict[int, np.ndarray] = {
+            pos: np.empty(0, dtype=np.int64) for pos in range(len(self.episodes_metadata))
+        }
+        if arrow_tbl.num_rows == 0:
+            return valid_by_pos
+
+        ep_arr = arrow_tbl.column("episode_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+        frame_arr = arrow_tbl.column("frame_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+
+        order = np.lexsort((frame_arr, ep_arr))
+        ep_sorted = ep_arr[order]
+        frame_sorted = frame_arr[order]
+        unique_eps, split_starts = np.unique(ep_sorted, return_index=True)
+        split_ends = np.append(split_starts[1:], len(ep_sorted))
+
+        for ep_id_np, s, e in zip(unique_eps, split_starts, split_ends, strict=True):
+            pos = self._ep_id_to_pos.get(int(ep_id_np))
+            if pos is None:
+                continue
+            ep_frames = np.unique(frame_sorted[s:e])
+            ep_len = self.episode_lengths[pos]
+            if len(ep_frames):
+                lo = int(np.searchsorted(ep_frames, 0, side="left"))
+                hi = int(np.searchsorted(ep_frames, ep_len, side="left"))
+                valid_by_pos[pos] = np.ascontiguousarray(ep_frames[lo:hi], dtype=np.int64)
+        return valid_by_pos
+
+    def get_valid_steps_for_episode(
+        self,
+        ep_idx: int,
+        *,
+        max_step_exclusive: int | None = None,
+    ) -> np.ndarray:
+        """Return sorted valid anchor ``frame_index`` values for positional episode ``ep_idx``."""
+        limit = self.episode_lengths[ep_idx]
+        if max_step_exclusive is not None:
+            limit = min(limit, int(max_step_exclusive))
+        if limit <= 0:
+            return np.empty(0, dtype=np.int64)
+        if self.valid_steps_by_episode is None:
+            return np.arange(0, limit, dtype=np.int64)
+        steps = self.valid_steps_by_episode.get(ep_idx)
+        if steps is None or len(steps) == 0:
+            return np.empty(0, dtype=np.int64)
+        cutoff = int(np.searchsorted(steps, limit, side="left"))
+        return steps[:cutoff]
+
     # -- per-thread readers ---------------------------------------------------------
     def _init_thread_state(self) -> None:
         self._tls = threading.local()
@@ -236,6 +326,22 @@ class LanceEpisodeLoader:
             r = self._reader0 if first else _fresh_reader(self._reader0)
             with _OPEN_LOCK:
                 r._ensure_open()
+                if self.lance_version is not None:
+                    try:
+                        from lancedb.permutation import Permutation
+
+                        pinned_table = self._open_frames_table(lance_version=self.lance_version)
+                        r._frames_perm = (
+                            Permutation.identity(pinned_table)
+                            .select_columns(r._fetch_columns)
+                            .with_format("arrow")
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not pin reader frames_perm to lance_version=%s: %s",
+                            self.lance_version,
+                            exc,
+                        )
             with self._readers_lock:
                 self._thread_readers.append(r)
             self._tls.reader = r

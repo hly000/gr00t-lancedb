@@ -33,6 +33,7 @@ LEROBOT_TASKS_FILENAME = "tasks.jsonl"
 LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILENAME = "stats.json"
 GROOT_STATS_FILENAME = "gr00t_stats.json"
+CURATION_REPORT_FILENAME = "curation_report.json"
 LEROBOT_RELATIVE_STATS_FILENAME = "relative_stats.json"
 INITIAL_ACTIONS_FILENAME = "initial_actions.npz"
 STATS_FINGERPRINTS_KEY = "__fingerprints__"
@@ -78,7 +79,7 @@ def _load_initial_actions_npz(path: Path) -> list[dict[str, Any]]:
         from gr00t.utils.initial_actions import load_initial_actions  # type: ignore[import-not-found]
 
         return load_initial_actions(path)
-    except ImportError:
+    except (ImportError, ValueError):
         pass
     data = np.load(path, allow_pickle=True)
     if "arr_0" in data and len(data.files) == 1:
@@ -430,6 +431,7 @@ def merge_statistics(
 
 __all__ = [
     "ALLOWED_MODALITIES",
+    "CURATION_REPORT_FILENAME",
     "DEFAULT_COLUMN_NAMES",
     "GROOT_STATS_FILENAME",
     "INITIAL_ACTIONS_FILENAME",

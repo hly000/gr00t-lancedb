@@ -225,6 +225,8 @@ def build_lance_mixture_dataset(
     storage_options: dict[str, str] | None = None,
     use_mini_mp4: bool = True,
     infinite: bool = True,
+    where: str | None = None,
+    lance_version: int | None = None,
 ) -> ResumableLanceMixtureDataset:
     """Build a ``ResumableLanceMixtureDataset`` from GR00T-style dataset specs.
 
@@ -244,6 +246,8 @@ def build_lance_mixture_dataset(
         mix_ratio = float(spec.get("mix_ratio", 1.0))
         mod_json = spec.get("modality_json_path")
         spec_opts = spec.get("storage_options", storage_options)
+        spec_where = spec.get("where", where)
+        spec_version = spec.get("lance_version", lance_version)
 
         group_datasets: list[LanceShardedSingleStepDataset] = []
         for path in spec["dataset_paths"]:
@@ -258,6 +262,8 @@ def build_lance_mixture_dataset(
                 modality_json_path=mod_json,
                 storage_options=spec_opts,
                 use_mini_mp4=use_mini_mp4,
+                where=spec_where,
+                lance_version=spec_version,
             )
             group_datasets.append(ds)
 
