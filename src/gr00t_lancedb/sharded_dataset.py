@@ -183,6 +183,13 @@ class LanceShardedSingleStepDataset(ShardedDataset):
     def get_initial_actions(self) -> list[dict[str, Any]]:
         return self.episode_loader.get_initial_actions()
 
+    @property
+    def is_open(self) -> bool:
+        return self.episode_loader.is_open
+
+    def assert_unopened(self) -> None:
+        self.episode_loader.assert_unopened()
+
     def close(self) -> None:
         self.episode_loader.close()
 
