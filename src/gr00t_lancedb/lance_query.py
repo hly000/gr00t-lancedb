@@ -13,13 +13,19 @@ from typing import Any
 
 import numpy as np
 
-from .metadata import (
-    CURATION_VERSIONS_FILENAME,
-    select_curation_entry,
-)
+# Not ``.metadata``: that module imports pandas and NVIDIA's ``gr00t`` (torch), which made
+# every child call about 12 s slower than the query itself.
+from ._curation_manifest import CURATION_VERSIONS_FILENAME, select_curation_entry
 
 FRAMES_TABLE = "frames"  # == lerobot_lancedb.FRAMES_TABLE
 META_TABLE = "meta"  # == lerobot_lancedb.META_TABLE
+
+
+def _ensure_lerobot_importable() -> None:
+    """The package ``__init__`` skips this in the child; lerobot needs it (see _hub_compat)."""
+    from ._hub_compat import ensure_hub_compat
+
+    ensure_hub_compat()
 
 
 def _connect(
@@ -44,6 +50,7 @@ def _connect(
         options = dict(storage_options or {})
         db = lancedb.connect(db_uri, storage_options=options) if options else lancedb.connect(db_uri)
         return db, options, db_uri, None
+    _ensure_lerobot_importable()
     from lerobot_lancedb.reader import _connect as ll_connect
     from lerobot_lancedb.reader import _storage_options, resolve_lance_root
 
@@ -163,6 +170,7 @@ def materialize_meta(
     token: str | bool | None = None,
 ) -> dict[str, Any]:
     """Materialize a remote dataset's ``meta/`` cache (cold start) and return its root."""
+    _ensure_lerobot_importable()
     from lerobot_lancedb.reader import resolve_lance_root
 
     db_uri, local_root = resolve_lance_root(repo_id, dataset_path, storage_options, revision, token)

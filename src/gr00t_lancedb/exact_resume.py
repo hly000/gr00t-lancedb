@@ -482,6 +482,9 @@ class ExactResumeMixin:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def __iter__(self):
+        from ._worker_exit import arm_worker_fast_exit
+
+        arm_worker_fast_exit()
         rng = np.random.default_rng(self.seed + self.epoch)
         splits = self._iter_splits(self._worker_schedule())
 
@@ -743,19 +746,36 @@ class WriteBandwidthCalibration:
     fsync'ed probe write at train start. They persist in ``preempt_calibration.json`` in the
     output dir, so a run resumed after preemption starts calibrated. With no samples a
     conservative prior (``GR00T_PREEMPT_PRIOR_WRITE_MBPS``, default 400 MB/s) is used.
+
+    An emergency save also spends time *before* the write, copying tensors off the GPU and
+    quantizing them (9.3 s for a 9.7 GB bf16 checkpoint on the A100 box, against 21.6 s of
+    writing). ``encode_samples`` track that rate per dtype preset, in checkpoint bytes per
+    second, with a prior of ``GR00T_PREEMPT_PRIOR_ENCODE_MBPS`` (default 1000 MB/s).
     """
 
-    def __init__(self, path: Path | None, prior_bps: float, overhead_s: float, max_samples: int = 8) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        prior_bps: float,
+        overhead_s: float,
+        max_samples: int = 8,
+        prior_encode_bps: float = 1e9,
+    ) -> None:
         self.path = path
         self.prior_bps = float(prior_bps)
+        self.prior_encode_bps = float(prior_encode_bps)
         self.overhead_s = float(overhead_s)
         self.max_samples = int(max_samples)
         self.samples: list[dict[str, Any]] = []
+        self.encode_samples: list[dict[str, Any]] = []
         if path is not None and path.is_file():
             try:
-                self.samples = list(json.loads(path.read_text(encoding="utf-8")).get("samples", []))
-            except (OSError, ValueError):
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                self.samples = list(stored.get("samples", []))
+                self.encode_samples = list(stored.get("encode_samples", []))
+            except (OSError, ValueError, AttributeError):
                 self.samples = []
+                self.encode_samples = []
 
     def add(self, nbytes: int, seconds: float, source: str) -> None:
         if nbytes <= 0 or seconds <= 0:
@@ -764,13 +784,28 @@ class WriteBandwidthCalibration:
         self.samples = self.samples[-self.max_samples :]
         self.save()
 
+    def add_encode(self, nbytes: int, seconds: float, dtype: str) -> None:
+        """Record how long encoding a ``dtype`` checkpoint of ``nbytes`` took."""
+        if nbytes <= 0 or seconds <= 0:
+            return
+        self.encode_samples.append(
+            {"bytes": int(nbytes), "seconds": float(seconds), "dtype": str(dtype), "t": time.time()}
+        )
+        self.encode_samples = self.encode_samples[-self.max_samples :]
+        self.save()
+
     def save(self) -> None:
         if self.path is None:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"samples": self.samples, "bytes_per_s": self.bytes_per_s()}, indent=2))
+            payload = {
+                "samples": self.samples,
+                "bytes_per_s": self.bytes_per_s(),
+                "encode_samples": self.encode_samples,
+            }
+            tmp.write_text(json.dumps(payload, indent=2))
             os.replace(tmp, self.path)
         except OSError:
             pass
@@ -783,8 +818,23 @@ class WriteBandwidthCalibration:
                 return float(rates[len(rates) // 2])
         return self.prior_bps
 
-    def estimate_s(self, nbytes: int) -> float:
-        return self.overhead_s + float(nbytes) / max(self.bytes_per_s(), 1.0)
+    def encode_bytes_per_s(self, dtype: str) -> float:
+        """Median measured encode rate for ``dtype``, else the prior.
+
+        Rates of other presets are not reused: bf16 is a cast, int8 a blockwise quantization.
+        """
+        rates = sorted(s["bytes"] / s["seconds"] for s in self.encode_samples if s.get("dtype") == dtype)
+        return float(rates[len(rates) // 2]) if rates else self.prior_encode_bps
+
+    def estimate_encode_s(self, nbytes: int, dtype: str) -> float:
+        return float(nbytes) / max(self.encode_bytes_per_s(dtype), 1.0)
+
+    def estimate_s(self, nbytes: int, dtype: str | None = None) -> float:
+        """Seconds to write ``nbytes``; with ``dtype`` also the time to encode them first."""
+        total = self.overhead_s + float(nbytes) / max(self.bytes_per_s(), 1.0)
+        if dtype is not None:
+            total += self.estimate_encode_s(nbytes, dtype)
+        return total
 
     @property
     def calibrated(self) -> bool:
@@ -872,7 +922,8 @@ def _make_preempt_callback(
     ``GR00T_PREEMPT_CKPT_DTYPE`` (``auto``; ``fp32|bf16|int8``), ``GR00T_PREEMPT_DEADLINE_S``
     (25: GCP/AWS grace minus margin), ``GR00T_PREEMPT_EXACT_WEIGHTS`` (0),
     ``GR00T_PREEMPT_EST_SAVE_S`` (unset = self-calibrated; a number pins the estimate),
-    ``GR00T_PREEMPT_PRIOR_WRITE_MBPS`` (400), ``GR00T_PREEMPT_SAVE_OVERHEAD_S`` (1.0),
+    ``GR00T_PREEMPT_PRIOR_WRITE_MBPS`` (400), ``GR00T_PREEMPT_PRIOR_ENCODE_MBPS`` (1000),
+    ``GR00T_PREEMPT_SAVE_OVERHEAD_S`` (1.0),
     ``GR00T_PREEMPT_PROBE_MB`` (64; background fsync'ed probe write at train start, 0=off),
     ``GR00T_PREEMPT_FSYNC`` (1), ``GR00T_PREEMPT_FAST_EXIT`` (1: ``os._exit(143)`` once the
     checkpoint decision is durable, skipping ~20 s of DataLoader / interpreter teardown).
@@ -893,6 +944,7 @@ def _make_preempt_callback(
     deadline = float(deadline_s if deadline_s is not None else env.get("GR00T_PREEMPT_DEADLINE_S", "25"))
     exact_weights = env.get("GR00T_PREEMPT_EXACT_WEIGHTS", "0") == "1"
     prior_bps = float(env.get("GR00T_PREEMPT_PRIOR_WRITE_MBPS", "400")) * 1e6
+    prior_encode_bps = float(env.get("GR00T_PREEMPT_PRIOR_ENCODE_MBPS", "1000")) * 1e6
     overhead_s = float(env.get("GR00T_PREEMPT_SAVE_OVERHEAD_S", "1.0"))
     probe_mb = int(float(env.get("GR00T_PREEMPT_PROBE_MB", "64")))
     do_fsync = env.get("GR00T_PREEMPT_FSYNC", "1") == "1"
@@ -915,7 +967,9 @@ def _make_preempt_callback(
             self.skipped_save: bool = False
             self.saved_light_ckpt: Path | None = None
             self.last_decision: dict[str, Any] | None = None
-            self.calibration = WriteBandwidthCalibration(None, prior_bps, overhead_s)
+            self.calibration = WriteBandwidthCalibration(
+                None, prior_bps, overhead_s, prior_encode_bps=prior_encode_bps
+            )
             self._output_dir: Path | None = None
             self.fast_exit = fast_exit
             # Callables run right before a fast exit (e.g. metrics writers' train_end).
@@ -927,8 +981,15 @@ def _make_preempt_callback(
                 return 0.0
             return sum(self._step_times) / len(self._step_times)
 
-        def estimate_save_s(self, nbytes: int) -> float:
-            return self.est_save_s if self.est_save_s is not None else self.calibration.estimate_s(nbytes)
+        def estimate_save_s(self, nbytes: int, dtype: str | None = None) -> float:
+            """Seconds until a checkpoint of ``nbytes`` is durable.
+
+            Pass ``dtype`` for the light emergency checkpoint, whose tensors have to be
+            copied off the GPU and encoded before the write starts.
+            """
+            if self.est_save_s is not None:
+                return self.est_save_s
+            return self.calibration.estimate_s(nbytes, dtype)
 
         # -- calibration ------------------------------------------------------------
         def _bind_output_dir(self, args) -> None:
@@ -936,7 +997,9 @@ def _make_preempt_callback(
             if out is None or self._output_dir == Path(out):
                 return
             self._output_dir = Path(out)
-            self.calibration = WriteBandwidthCalibration(self._output_dir / CALIBRATION_FILENAME, prior_bps, overhead_s)
+            self.calibration = WriteBandwidthCalibration(
+                self._output_dir / CALIBRATION_FILENAME, prior_bps, overhead_s, prior_encode_bps=prior_encode_bps
+            )
 
         def _start_probe(self) -> None:
             if probe_mb <= 0 or self._output_dir is None or self.est_save_s is not None:
@@ -1027,7 +1090,7 @@ def _make_preempt_callback(
                 cands = ("fp32", "bf16", "int8") if self.ckpt_dtype == "auto" else (self.ckpt_dtype,)
                 est_by_dtype = {
                     d: self.estimate_save_s(
-                        estimate_payload_bytes(mdl, opt, resolve_preset(d, exact_weights=exact_weights))
+                        estimate_payload_bytes(mdl, opt, resolve_preset(d, exact_weights=exact_weights)), d
                     )
                     for d in cands
                 }
@@ -1088,6 +1151,7 @@ def _make_preempt_callback(
                     )
                     self.saved_light_ckpt = ckpt_dir
                     self.calibration.add(stats["bytes"], stats["write_s"], "emergency")
+                    self.calibration.add_encode(stats["bytes"], stats["encode_s"], stats["dtype"])
                     logger.warning(
                         "Preempted at step %d: wrote %s emergency checkpoint (%.2f GB) to %s in %.2fs "
                         "(est %.2fs, wasted_s=%.2fs).",
