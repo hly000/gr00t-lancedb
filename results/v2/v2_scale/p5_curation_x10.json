@@ -1,0 +1,81 @@
+{
+  "dataset": "/data/datasets/x_tier/x10/v21",
+  "config": {
+    "drop_frac": 0.05,
+    "drop_seed": 42,
+    "idle_eps": 0.001,
+    "action_horizon": 16,
+    "video_mode": "copy",
+    "total_episodes": 3790,
+    "total_frames": 1014690
+  },
+  "lance_convert_s": null,
+  "native_v2": {
+    "method": "native_lerobot_v2.1",
+    "wall_time_s": 18.7493,
+    "breakdown_s": {
+      "scan_parquets_s": 7.2868,
+      "recompute_stats_s": 1.344,
+      "copy_parquets_s": 1.9643,
+      "copy_videos_s": 8.1145,
+      "rewrite_meta_s": 0.0232
+    },
+    "total_episodes_before": 3790,
+    "bad_episodes_dropped": 190,
+    "surviving_episodes": 3600,
+    "total_frames_before": 1014690,
+    "surviving_frames": 963513,
+    "idle_frames_detected": 1780,
+    "mid_episode_idle_filtering_supported": false,
+    "mid_episode_idle_note": "Native GR00T v2.1 cannot drop mid-episode idle frames without breaking 16-step action horizon / video temporal continuity (or re-encoding MP4s).",
+    "bytes_written_parquets": 86235105,
+    "bytes_written_videos": 5942370510,
+    "bytes_written_meta": 9833187,
+    "bytes_written_total": 6038438802,
+    "files_touched": 10807,
+    "files_written_videos": 7200,
+    "resulting_disk_bytes": 6038438802,
+    "resulting_file_count": 10807
+  },
+  "lance": {
+    "method": "lance_tabular_evolution",
+    "wall_time_s": 3.1578,
+    "frames_version_before": 3,
+    "frames_version_after": 6,
+    "total_episodes": 3790,
+    "bad_episodes": 190,
+    "valid_episodes": 3600,
+    "total_frames": 1014690,
+    "idle_frames": 1780,
+    "anomaly_frames": 0,
+    "valid_frames": 961825,
+    "valid_pct": 94.79,
+    "mid_episode_idle_filtering_supported": true,
+    "bytes_written_frames": 8173126,
+    "bytes_written_videos": 0,
+    "bytes_written_meta": 48610,
+    "bytes_written_total": 8221736,
+    "files_written_frames": 10,
+    "files_written_videos": 0,
+    "scalar_indexes_built": [
+      "is_valid",
+      "is_bad_episode"
+    ],
+    "disk_before_bytes": 6334043576,
+    "disk_after_bytes": 6342259548,
+    "disk_delta_bytes": 8215972,
+    "resulting_file_count": 57,
+    "unfiltered_init_s": 0.1665,
+    "filtered_init_s": 13.6527,
+    "unfiltered_anchors": 957840,
+    "filtered_anchors": 907880,
+    "anchor_reduction_pct": 5.22,
+    "upstream_lerobot_lancedb_compatible": true
+  },
+  "comparison": {
+    "wall_time_speedup": 5.94,
+    "bytes_written_reduction_x": 734.45,
+    "video_bytes_saved": 5942370510
+  },
+  "markdown_summary": "### E6 Curation & Repair Benchmark (Native LeRobot v2.1 vs Lance)\n\n- **Dataset**: `/data/datasets/x_tier/x10/v21` (3790 episodes, 1014690 frames)\n- **Workload**: drop `5.0%` bad episodes (`seed=42`) + filter idle frames (`idle_eps=0.001`) + recompute GR00T `q01`/`q99` stats\n\n| Metric | Native LeRobot v2.1 (curated copy) | Lance (zero-copy column evolution) | Ratio / Delta |\n|---|---:|---:|---:|\n| Wall time (s) | 18.749 s | **3.158 s** | **5.9x faster** |\n| Total bytes written | 6038.44 MB | **8.22 MB** | **734x less I/O** |\n| Video bytes written | 5942.37 MB (7200 MP4s) | **0.00 MB (0 files)** | **0 video rewrite** |\n| Tabular / frames bytes written | 86.24 MB | 8.17 MB | \u2014 |\n| Metadata bytes written | 9.83 MB | 0.05 MB | \u2014 |\n| Files / objects written | 10807 | **10 (frames) + meta** | \u2014 |\n| Resulting disk footprint | 6038.44 MB | 6342.26 MB (+8.22 MB) | \u2014 |\n| Mid-episode idle filtering | Not supported without breaking horizons / re-encoding MP4s | **Supported (`where=\"is_valid = true\"`)** | **5.2% anchors filtered** |\n| Filtered dataset init time | N/A | **13652.7 ms** (907,880 / 957,840 anchors) | Lance v3 -> v6 |\n| Unmodified `lerobot-lancedb` compat | N/A | **PASS** | Zero breaking changes |\n"
+}

@@ -1,0 +1,1 @@
+{"lance_blob_calls": 0, "lance_blob_ranges": 0, "lance_blob_bytes": 0, "lance_handle_reads": 0, "lance_handle_bytes": 0, "requested_ranges": 0, "requested_bytes": 0, "gop_cache_hits": 0, "gop_cache_misses": 0, "gop_cache_hit_bytes": 0, "gop_cache_miss_bytes": 0, "gop_cache_evictions": 0, "gop_cache_evicted_bytes": 0, "frames_take_calls": 0, "frames_take_rows": 0}

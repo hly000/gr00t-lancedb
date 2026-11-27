@@ -1,0 +1,43 @@
+{
+  "created_unix": 1795754971.5389254,
+  "source": {
+    "path": "/data/datasets/libero_10",
+    "files": 3432,
+    "logical_bytes": 636417222,
+    "unique_disk_bytes": 636417222
+  },
+  "link_mode": "hardlink",
+  "lance_modes": [
+    "copy"
+  ],
+  "dry_run": false,
+  "tiers": [
+    {
+      "factor": 10,
+      "variants": {
+        "v21": {
+          "path": "/data/datasets/x_tier/x10/v21",
+          "build_s": 8.26,
+          "video_placement": {
+            "hardlink": 7580
+          },
+          "files": 11378,
+          "logical_bytes": 6356461079,
+          "unique_disk_bytes": 726246227
+        },
+        "lance_copy": {
+          "path": "/data/datasets/x_tier/x10/lance_copy",
+          "build_s": 68.614,
+          "video_base_uri": null,
+          "files": 37,
+          "logical_bytes": 6334043576,
+          "unique_disk_bytes": 6334043576
+        }
+      },
+      "episodes": 3790,
+      "frames": 1014690,
+      "videos": 7580,
+      "warnings": []
+    }
+  ]
+}
