@@ -18,6 +18,9 @@ from .metadata import (
     select_curation_entry,
 )
 
+FRAMES_TABLE = "frames"  # == lerobot_lancedb.FRAMES_TABLE
+META_TABLE = "meta"  # == lerobot_lancedb.META_TABLE
+
 
 def _connect(
     dataset_path: str,
@@ -27,6 +30,20 @@ def _connect(
     revision: str | None,
     token: str | bool | None,
 ):
+    raw = str(dataset_path)
+    if repo_id is None and not raw.startswith(("hf://", "file://")):
+        # Local directory or s3:// / gs:// / az://: plain lancedb is enough. Skipping the
+        # lerobot import keeps this child at ~0.5 s instead of ~2.7 s.
+        import os
+
+        import lancedb
+
+        db_uri = raw.rstrip("/") if "://" in raw else raw
+        if "://" in raw:
+            os.environ.setdefault("LANCE_IO_THREADS", "256")  # same as lerobot_lancedb
+        options = dict(storage_options or {})
+        db = lancedb.connect(db_uri, storage_options=options) if options else lancedb.connect(db_uri)
+        return db, options, db_uri, None
     from lerobot_lancedb.reader import _connect as ll_connect
     from lerobot_lancedb.reader import _storage_options, resolve_lance_root
 
@@ -40,8 +57,6 @@ def _open(db, name: str, options: dict[str, str] | None):
 
 
 def _read_meta_files(db, options, names: list[str] | None) -> dict[str, bytes]:
-    from lerobot_lancedb import META_TABLE
-
     try:
         table = _open(db, META_TABLE, options or None)
     except Exception:  # noqa: BLE001 - datasets converted without meta.lance
@@ -105,8 +120,6 @@ def query_where_anchors(
     scalar indexes when present) are read — never ``videos.lance``. Returns the resolved
     table version so the caller can pin readers and stats to the same MVCC snapshot.
     """
-    from lerobot_lancedb import FRAMES_TABLE
-
     db, options, db_uri, _ = _connect(
         dataset_path, repo_id=repo_id, storage_options=storage_options, revision=revision, token=token
     )
