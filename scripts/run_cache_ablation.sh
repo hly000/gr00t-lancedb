@@ -12,7 +12,7 @@
 #   EVAL=1       also run LIBERO-10 closed-loop for each config (N_EPISODES per task, default 10)
 #   NATIVE_CKPT  if set, its probe loss is added to the comparison (e.g. group1 checkpoint-3000)
 #
-# Budget on an A100 at 3,000 steps: ~9 min of training per config; closed-loop adds ~16 min per 50 episodes.
+# Budget on an A100 at 3,000 steps: ~9 min of training per compiled config (eager fp32 is slower); closed-loop adds ~16 min per 50 episodes.
 # Run first:  pytest tests/test_turbo_lowmem_adamw.py -k triton -q
 set -euo pipefail
 
@@ -41,11 +41,13 @@ cd "$GR00T_ROOT"
 
 flags_for() {
   case "$1" in
+    # fp32 weights + bf16 autocast crashes PyTorch 2.9's Inductor at step 1, so those run eager.
+    # (The trainer also falls back to eager by itself if a compiled dry run fails.)
     fp32_adamw)      echo "--fp32-master-weights --optimizer adamw" ;;
-    bf16_lowmem)     echo "--no-fp32-master-weights --optimizer lowmem" ;;
+    bf16_lowmem)     echo "--no-fp32-master-weights --optimizer lowmem --compile" ;;
     fp32_lowmem)     echo "--fp32-master-weights --optimizer lowmem" ;;
-    bf16_adamw)      echo "--no-fp32-master-weights --optimizer adamw" ;;
-    bf16_lowmem_mn4) echo "--no-fp32-master-weights --optimizer lowmem --multi-noise 4" ;;
+    bf16_adamw)      echo "--no-fp32-master-weights --optimizer adamw --compile" ;;
+    bf16_lowmem_mn4) echo "--no-fp32-master-weights --optimizer lowmem --multi-noise 4 --compile" ;;
     *) echo "unknown config $1" >&2; exit 2 ;;
   esac
 }
@@ -64,7 +66,7 @@ for cfg in $CONFIGS; do
     uv run --no-sync python "$REPO_ROOT/scripts/train_vl_cache_e2e.py" \
       --gr00t-root "$GR00T_ROOT" --base-model-path "$BASE_MODEL" --dataset-path "$DATASET" \
       --embodiment-tag LIBERO_PANDA --cache-dir "$CACHE_DIR" --output-dir "$out" \
-      --batch-size "$BATCH_SIZE" --max-steps "$MAX_STEPS" --compile --num-workers 4 --seed "$SEED" \
+      --batch-size "$BATCH_SIZE" --max-steps "$MAX_STEPS" --num-workers 4 --seed "$SEED" \
       $(flags_for "$cfg") 2>&1 | tee "$out.train.log"
   fi
   PROBE_ARGS+=(--ckpt "$cfg=$out/merged_gr00t_ckpt")

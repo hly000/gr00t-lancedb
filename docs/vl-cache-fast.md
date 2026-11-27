@@ -35,7 +35,7 @@ GPU 端编码和原来的 numpy 编码**逐字节一致**（有测试），指�
 
 状态、动作、掩码以 fp32 送进动作头，和原生训练一致（原生靠 `autocast` 在各层内部转 bf16）。这样流匹配的时间 `t`、加噪轨迹和速度目标都在 fp32 里构造。新缓存的标量按 fp32 落盘；旧缓存里 float16 的标量读入时转成 fp32。
 
-bf16 权重配 fp32 输入这条路径没在真实模型上跑过。训练开始时会先试一次前向，如果动作头里有算子拒绝这种精度混用，会打印警告并退回 bf16 输入，实际用的精度记在 `train_summary.json` 的 `input_dtype`。
+bf16 权重配 fp32 输入这条路径没在真实模型上跑过；另外已知 fp32 权重配 `torch.compile` 在 PyTorch 2.9 上第 1 步会崩。所以训练开始时先做一次试跑：一次带反向的训练前向，加一次探针前向。失败就依次退回"不编译"、"bf16 输入"，并打印警告。实际用的设置记在 `train_summary.json` 的 `compile` 和 `input_dtype`，对比两组的每步耗时前先看这两项是否一致。
 
 ## 一次 GPU 会话该怎么跑
 
@@ -49,7 +49,7 @@ python scripts/eval_cached_fm_loss.py --cache-dir /data/tmp/libero10_vl_cache_fu
   --ckpt cache_v1=/data/runs/e2e_ablation_3000s/group2_vl_cache/merged_gr00t_ckpt \
   --ckpt base=nvidia/GR00T-N1.7-3B
 
-# 2. 每个配置约 9 分钟训练。默认两组：fp32_adamw（精度基准）和 bf16_lowmem（24 GB 候选）
+# 2. 默认两组：fp32_adamw（精度基准，不编译，更慢）和 bf16_lowmem（24 GB 候选，编译，约 9 分钟）
 NATIVE_CKPT=/data/runs/e2e_ablation_3000s/group1_native_online/checkpoint-3000 \
   bash scripts/run_cache_ablation.sh
 
@@ -70,7 +70,7 @@ EVAL=1 N_EPISODES=10 bash scripts/run_cache_ablation.sh    # 已训练的配置�
 ## 关于首版 27% 的几点判断
 
 - 3,000 步 × 32 = 96,000 个样本，数据集有 95,784 帧，等于**每帧只看了一遍**。单视角、没有图像增强造成的过拟合要靠重复看同一帧才会出现，所以它解释不了这次掉点，Hybrid 80/20 在这个训练量下也补不了什么。训练多个 epoch 时这个问题才会出现。
-- float16 的状态和动作误差不超过 6e-5（归一化后），而模型内部本来就在 bf16 里算，这一项可以排除。
+- float16 的状态和动作在 ±1 范围内误差不超过 2.5e-4，是 bf16 舍入误差的八分之一，而模型内部本来就在 bf16 里算，这一项可以排除。
 - 纯 bf16 权重是最可能的主因：`lr=1e-4` 时大部分更新不到半个 ulp，被直接舍掉。
 - 特征加噪（5% token 丢弃 + 1% 抖动）和 int8 量化的影响没有单独量过；`profile_kernels.py` 的 `features` 一节会给出 int8 的误差和对 loss 的影响。
 

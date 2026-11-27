@@ -238,3 +238,23 @@ def prepare_probe_isolated(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
     with mp.get_context("spawn").Pool(1) as pool:
         return pool.apply(prepare_probe, args, kwargs)
+
+
+def first_working(attempts: Sequence[Any], run: Any, log: Any = print) -> Any:
+    """Return the first item of ``attempts`` for which ``run(item)`` does not raise.
+
+    Earlier failures are logged, the last one propagates. Used to fall back from a compiled
+    to an eager model (and from fp32 to bf16 inputs) before training starts instead of
+    crashing at step 1.
+    """
+    if not attempts:
+        raise ValueError("no attempts given")
+    for i, item in enumerate(attempts):
+        try:
+            run(item)
+            return item
+        except Exception as exc:  # noqa: BLE001 - compiler failures come in many types
+            if i + 1 == len(attempts):
+                raise
+            log(f"[fallback] {item!r} failed: {type(exc).__name__}: {str(exc)[:300]} -- trying {attempts[i + 1]!r}")
+    raise AssertionError("unreachable")

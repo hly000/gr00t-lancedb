@@ -26,6 +26,7 @@ from gr00t_lancedb.vl_cache import (  # noqa: E402
 )
 from gr00t_lancedb.vl_cache.codec import compute_pooled_visual_emb, encode_features  # noqa: E402
 from gr00t_lancedb.vl_cache.probe import (  # noqa: E402
+    first_working,
     load_cached_batch,
     load_scalars,
     paired_probe_diff,
@@ -271,3 +272,17 @@ def test_ablation_summary_and_cache_lookup(tmp_path: Path):
     ev = _load_script("eval_cached_fm_loss")
     fp, scalars_path = _make_cache(tmp_path / "cache", True)
     assert ev.find_cache(str(tmp_path / "cache"), None) == (fp.table_name(), scalars_path)
+
+
+def test_first_working_falls_back_in_order():
+    tried, logs = [], []
+
+    def run(item):
+        tried.append(item)
+        if item[0]:  # "compiled" attempts fail
+            raise TypeError("sympy blew up")
+
+    assert first_working([(True, "fp32"), (False, "fp32"), (False, "bf16")], run, log=logs.append) == (False, "fp32")
+    assert tried == [(True, "fp32"), (False, "fp32")] and len(logs) == 1 and "TypeError" in logs[0]
+    with pytest.raises(TypeError):  # the last failure is not swallowed
+        first_working([(True, "a"), (True, "b")], run, log=logs.append)

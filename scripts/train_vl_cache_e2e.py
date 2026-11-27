@@ -373,7 +373,7 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         probe_fm_loss,
         save_action_head_checkpoint,
     )
-    from gr00t_lancedb.vl_cache.probe import prepare_probe_isolated
+    from gr00t_lancedb.vl_cache.probe import first_working, prepare_probe_isolated
 
     device = "cuda"
     torch.manual_seed(args.seed)
@@ -431,18 +431,39 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         seed=args.seed,
         row_pool=probe["train_rows"],
     )
-    # The native trainer feeds fp32 state/action and lets autocast cast inside each layer.
-    # With bf16 weights an op outside autocast's cast list could reject the dtype mix, so try it
-    # once up front and fall back to parameter-dtype inputs (recorded in the summary) if it does.
-    scalar_dtype = torch.float32
-    try:
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            ah(*head_inputs_from_cached(probe["probe_batches"][0], device, scalar_dtype=scalar_dtype))
-    except RuntimeError as exc:
-        if param_dtype == torch.float32:
-            raise
-        print(f"[train] WARNING: fp32 inputs rejected by the bf16 head ({exc}); using bf16 inputs", flush=True)
-        scalar_dtype = param_dtype
+    # Fail in the first minute, not at step 1 or at the first probe. Two things are unproven on
+    # the real model and both have a known fallback:
+    #   * torch.compile: PyTorch 2.9's Inductor crashed on fp32 weights + bf16 autocast here.
+    #   * fp32 state/action into a bf16 head (what the native trainer does with fp32 weights):
+    #     an op outside autocast's cast list could reject the dtype mix.
+    # One training-shaped forward+backward and one probe-shaped eval forward exercise every
+    # graph the run will compile. What was actually used is recorded in the summary.
+    def _dry_run(dtype: Any) -> None:
+        first = {k: (v[:frames_per_step] if torch.is_tensor(v) else v) for k, v in probe["probe_batches"][0].items()}
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            dry_loss = ah(*head_inputs_from_cached(first, device, scalar_dtype=dtype))["loss"]
+        dry_loss.backward()
+        opt.zero_grad(set_to_none=True)
+        probe_fm_loss(
+            ah, probe["probe_batches"][:1], device=device, seeds=(0,), amp_dtype=torch.bfloat16, scalar_dtype=dtype
+        )
+
+    attempts: list[tuple[bool, Any]] = [(bool(args.compile), torch.float32)]
+    if args.compile:
+        attempts.append((False, torch.float32))
+    if param_dtype != torch.float32:
+        attempts.append((False, param_dtype))
+
+    def _try(attempt: tuple[bool, Any]) -> None:
+        if not attempt[0] and hasattr(ah.model, "_orig_mod"):
+            ah.model = ah.model._orig_mod
+        try:
+            _dry_run(attempt[1])
+        finally:
+            opt.zero_grad(set_to_none=True)
+
+    used_compile, scalar_dtype = first_working(attempts, _try, log=lambda m: print(f"[train] WARNING {m}", flush=True))
+    torch.cuda.reset_peak_memory_stats()
 
     probe_curve: list[dict[str, Any]] = []
     probe_s = 0.0
@@ -469,7 +490,7 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
 
     print(
         f"[train] Starting ActionHead-Only training: steps={args.max_steps}, frames/step={frames_per_step}, "
-        f"k_noise={args.multi_noise}, eff_B={frames_per_step * args.multi_noise}, compile={args.compile}, "
+        f"k_noise={args.multi_noise}, eff_B={frames_per_step * args.multi_noise}, compile={used_compile}, "
         f"opt={opt_name}",
         flush=True,
     )
@@ -518,7 +539,7 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
     peak_resv_gb = round(torch.cuda.max_memory_reserved() / 1024**3, 3)
 
     # Unwrap compiled model before saving state_dict so weight keys stay 100% standard
-    if args.compile and hasattr(ah.model, "_orig_mod"):
+    if hasattr(ah.model, "_orig_mod"):
         ah.model = ah.model._orig_mod
 
     out_root = Path(args.output_dir)
@@ -554,7 +575,8 @@ def train_and_export(args: argparse.Namespace, mat_summary: dict[str, Any]) -> d
         "frames_per_step": frames_per_step,
         "multi_noise": args.multi_noise,
         "effective_batch_size": frames_per_step * args.multi_noise,
-        "compile": args.compile,
+        "compile": used_compile,
+        "compile_requested": bool(args.compile),
         "token_dropout": args.token_dropout,
         "gaussian_jitter": args.gaussian_jitter,
         "optimizer": opt_name,
