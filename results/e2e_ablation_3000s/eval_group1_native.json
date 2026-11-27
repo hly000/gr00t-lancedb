@@ -1,0 +1,89 @@
+{
+  "model_path": "/data/runs/e2e_ablation_3000s/group1_native_online/checkpoint-3000",
+  "n_episodes_per_task": 5,
+  "total_episodes": 50,
+  "mean_success_rate": 0.8167,
+  "eval_wall_s": 966.39,
+  "tasks": [
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 84.43,
+      "returncode": 0,
+      "tail": " float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:23<01:32, 23.03s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:25<00:32, 10.91s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:31<00:05,  5.90s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:34<00:00,  5.13s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:37<00:00,  7.45s/it]\n"
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 91.94,
+      "returncode": 0,
+      "tail": "Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:17<01:10, 17.67s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:19<00:25,  8.53s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:23<00:12,  6.23s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:27<00:05,  5.59s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:42<00:00,  8.86s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:45<00:00,  9.03s/it]\n"
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it",
+      "n_episodes": 5,
+      "success_rate": 0.6666666666666666,
+      "wall_s": 91.73,
+      "returncode": 0,
+      "tail": " float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:15<01:02, 15.62s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:24<00:14,  7.21s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:39<00:10, 10.10s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:49<00:00, 10.04s/it]\nEpisodes: 6it [00:51,  8.51s/it]                       \n"
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 70.47,
+      "returncode": 0,
+      "tail": "y, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:15<01:00, 15.18s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:17<00:22,  7.58s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:19<00:09,  4.98s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:24<00:00,  3.70s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:26<00:00,  5.34s/it]\n"
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 101.77,
+      "returncode": 0,
+      "tail": "Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:17<01:10, 17.60s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:25<00:35, 11.80s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:28<00:16,  8.03s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:42<00:10, 10.33s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:48<00:00,  8.70s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:52<00:00, 10.42s/it]\n"
+    },
+    {
+      "task": "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 65.06,
+      "returncode": 0,
+      "tail": " float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:10<00:43, 10.99s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:12<00:06,  3.49s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:14<00:02,  2.88s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:18<00:00,  3.21s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:20<00:00,  4.10s/it]\n"
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 99.38,
+      "returncode": 0,
+      "tail": " float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:15<01:00, 15.18s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:17<00:09,  4.78s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:46<00:13, 13.34s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:49<00:00,  9.87s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:52<00:00, 10.48s/it]\n"
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket",
+      "n_episodes": 5,
+      "success_rate": 1.0,
+      "wall_s": 85.49,
+      "returncode": 0,
+      "tail": "Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:15<01:01, 15.50s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:18<00:23,  7.87s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:19<00:10,  5.13s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:24<00:04,  4.93s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:38<00:00,  8.27s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:40<00:00,  8.16s/it]\n"
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove",
+      "n_episodes": 5,
+      "success_rate": 0.0,
+      "wall_s": 90.31,
+      "returncode": 0,
+      "tail": "thon3.12/site-packages/gymnasium/utils/passive_env_checker.py:135: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting numpy array dtype to be float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:48<03:12, 48.09s/it]\nEpisodes: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 5/5 [00:49<00:00,  9.85s/it]\n"
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
+      "n_episodes": 5,
+      "success_rate": 0.5,
+      "wall_s": 101.36,
+      "returncode": 0,
+      "tail": " float32, actual type: float64\u001b[0m\n  logger.warn(\n/data/Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_uv/.venv/lib/python3.12/site-packages/gymnasium/utils/passive_env_checker.py:131: UserWarning: \u001b[33mWARN: The obs returned by the `step()` method was expecting a numpy array, actual type: <class 'list'>\u001b[0m\n  logger.warn(\n\nEpisodes:  20%|\u2588\u2588        | 1/5 [00:22<01:31, 22.84s/it]\nEpisodes:  40%|\u2588\u2588\u2588\u2588      | 2/5 [00:27<00:35, 11.88s/it]\nEpisodes:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 3/5 [00:49<00:33, 16.69s/it]\nEpisodes:  80%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588  | 4/5 [00:53<00:11, 11.85s/it]\nEpisodes: 6it [00:56,  9.34s/it]                       \n"
+    }
+  ]
+}
