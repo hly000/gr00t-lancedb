@@ -605,7 +605,9 @@ def cmd_train_smoke(args: argparse.Namespace) -> dict[str, Any]:
     raw_batch = batches[0]
 
     _reset_gpu()
-    model = AutoModel.from_pretrained(args.base_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
+    model = AutoModel.from_pretrained(args.base_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
+        device=device, dtype=torch.bfloat16
+    )
     model.eval()  # Disable dropout for deterministic parity check
     bb_in, act_in = model.prepare_input(dict(raw_batch))
     with torch.no_grad():
