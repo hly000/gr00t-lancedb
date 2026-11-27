@@ -169,6 +169,8 @@
 
 ## 6. 剩余实验排期
 
+> 详细设计（对照组的复位动作、抢占时间表、规模阶梯、埋点、消融、决策点）见 **[第二阶段实验设计（v1）](experiment-design-v1.md)**。下表是摘要。
+
 | 优先级 | 实验 | 数据集 | 需要什么 | 估时 |
 |---|---|---|---|---|
 | 1 ⏳ | RoboCasa 4 任务（约 32 GB）：P0 抽检 + P2 + P3（A/C/D） | `single_panda_gripper.{CoffeePressButton, TurnSinkSpout, TurnOffStove, CloseDrawer}` | 正在从 HF 下载（免费账号每 5 分钟 1,000 次请求，每个任务约 1.2 万个文件） | 下载约 30 分钟 + 实验 1 小时 |
