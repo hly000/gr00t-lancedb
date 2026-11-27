@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from lerobot_lancedb import lance_mp_context
+from ._isolated import lance_mp_context
 
 from ._gr00t_compat import BaseProcessor
 from .metadata import merge_statistics

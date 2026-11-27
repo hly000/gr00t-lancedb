@@ -20,7 +20,7 @@ from ._gr00t_compat import (
     VLAStepData,
     coerce_embodiment_tag,
 )
-from .episode_loader import LanceEpisodeLoader
+from .episode_loader import DEFAULT_VIDEO_DECODER_CACHE_SIZE, LanceEpisodeLoader
 
 
 class LanceShardedSingleStepDataset(ShardedDataset):
@@ -50,9 +50,12 @@ class LanceShardedSingleStepDataset(ShardedDataset):
         revision: str | None = None,
         token: str | bool | None = None,
         use_mini_mp4: bool = True,
-        video_decoder_cache_size: int = 16,
+        video_decoder_cache_size: int = DEFAULT_VIDEO_DECODER_CACHE_SIZE,
         where: str | None = None,
         lance_version: int | None = None,
+        video_cache_dir: str | Path | None = None,
+        video_cache_gb: float | None = None,
+        video_cache_force_local: bool | None = None,
     ) -> None:
         super().__init__(str(dataset_path))
         self.embodiment_tag = coerce_embodiment_tag(embodiment_tag)
@@ -82,6 +85,9 @@ class LanceShardedSingleStepDataset(ShardedDataset):
             video_decoder_cache_size=video_decoder_cache_size,
             where=where,
             lance_version=lance_version,
+            video_cache_dir=video_cache_dir,
+            video_cache_gb=video_cache_gb,
+            video_cache_force_local=video_cache_force_local,
         )
         # Keep validated modality configs from the loader (handles multi-language truncation, etc.)
         self.modality_configs = self.episode_loader.modality_configs
@@ -201,6 +207,11 @@ class LanceShardedSingleStepDataset(ShardedDataset):
 
     def get_initial_actions(self) -> list[dict[str, Any]]:
         return self.episode_loader.get_initial_actions()
+
+    @property
+    def frames_version(self) -> int | None:
+        """MVCC snapshot of ``frames.lance`` this dataset is pinned to (``None`` = latest)."""
+        return self.episode_loader.frames_version
 
     @property
     def is_open(self) -> bool:

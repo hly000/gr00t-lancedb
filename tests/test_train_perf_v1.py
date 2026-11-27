@@ -327,12 +327,20 @@ def test_episode_loader_unopened_thread_safety_and_20_fork_cycles(
         ),
         encoding="utf-8",
     )
+    import os
+
+    child_env = os.environ.copy()
+    here = Path(__file__).resolve().parent
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        [str(here.parent / "src"), str(here), child_env.get("PYTHONPATH", "")]
+    )
     proc = subprocess.run(
         [sys.executable, str(fork_script), str(lance_dir)],
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
+        env=child_env,
     )
     assert proc.returncode == 0, f"fork stress failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "FORK_STRESS_OK:20" in proc.stdout

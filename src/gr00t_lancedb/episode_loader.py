@@ -10,38 +10,127 @@ language annotation resolution, and ``VLAStepData`` output contract.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
 import random
+import re
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import torch
 
-from lerobot_lancedb import FRAMES_TABLE, LanceDBDataset
-from lerobot_lancedb._source import is_remote_uri
-from lerobot_lancedb.reader import resolve_lance_root
-
 from ._gr00t_compat import EmbodimentTag, ModalityConfig, VLAStepData
-
-# lancedb registers its blob Arrow extension type lazily on first table open; two threads
-# opening at once race on that registration ("lance.blob.v2 is already registered").
-_OPEN_LOCK = threading.Lock()
-
-from .metadata import (  # noqa: E402
+from .metadata import (
+    CURATION_VERSIONS_FILENAME,
     DEFAULT_COLUMN_NAMES,
     LANG_KEYS,
     extract_dataset_statistics,
     load_gr00t_meta_bundle,
     parse_and_validate_modality_configs,
     resolve_video_original_key,
+    select_curation_entry,
 )
 
+if TYPE_CHECKING:  # imported lazily at runtime: lerobot + lancedb + av cost ~2-3 s
+    from lerobot_lancedb import LanceDBDataset
+
+# lancedb registers its blob Arrow extension type lazily on first table open; two threads
+# opening at once race on that registration ("lance.blob.v2 is already registered").
+_OPEN_LOCK = threading.Lock()
+
+# Same value as ``lerobot_lancedb.FRAMES_TABLE``; duplicated so that importing this module
+# never imports lerobot_lancedb (and through it lerobot, lancedb, av) in the main process.
+FRAMES_TABLE = "frames"
+DEFAULT_VIDEO_DECODER_CACHE_SIZE = 64
+
 logger = logging.getLogger(__name__)
+
+
+def is_remote_uri(path: str | Path) -> bool:
+    """``s3://``, ``gs://``, ``hf://`` ... (``file://`` counts as local)."""
+    raw = str(path)
+    return "://" in raw and not raw.startswith("file://")
+
+
+def _user_cache_dir() -> Path:
+    base = os.environ.get("GR00T_LANCE_CACHE_DIR")
+    if base:
+        return Path(base)
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "gr00t_lancedb"
+
+
+def _remote_meta_cache_root(
+    root: str, storage_options: dict | None, revision: str | None, token: str | bool | None
+) -> Path | None:
+    """Mirror of ``lerobot_lancedb.reader.resolve_lance_root``'s cache path (no Lance I/O).
+
+    Returns ``None`` if lerobot-lancedb's internals changed, in which case the caller falls
+    back to the in-process resolution.
+    """
+    try:
+        from lerobot_lancedb import reader as _r
+
+        db_uri = str(root).rstrip("/")
+        options = _r._storage_options(db_uri, storage_options, revision, token)
+        cache_key = db_uri
+        routing = {k.lower(): v for k, v in options.items() if k.lower() in _r._METADATA_ROUTING_OPTIONS}
+        if db_uri.startswith("hf://"):
+            ref = options.get("hf_revision", options.get("revision"))
+            if ref:
+                routing["revision"] = ref
+        if routing:
+            identity = json.dumps(routing, sort_keys=True, separators=(",", ":"))
+            cache_key += "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        return Path(_r.HF_LEROBOT_HOME) / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", cache_key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_FORK_PRELOAD = {"armed": False}
+
+
+def _preload_before_fork() -> None:
+    """``os.register_at_fork(before=...)``: make forked workers inherit the Lance stack.
+
+    The main process deliberately does not import lerobot-lancedb at dataset build time.
+    Right before the first ``fork()`` (DataLoader workers) we join a running background
+    preload, or import synchronously once, so (1) no fork happens mid-import, (2) workers
+    do not each pay the import on the first batch, and (3) macOS' ObjC fork-safety check
+    is not tripped by first-time framework initialization inside a child.
+    """
+    import sys
+
+    if not _FORK_PRELOAD["armed"] or os.environ.get("GR00T_LANCE_PRELOAD_BEFORE_FORK", "1") != "1":
+        return
+    try:
+        import gr00t_lancedb as _pkg
+
+        if "lerobot_lancedb" in sys.modules and _pkg._PRELOAD["thread"] is None:
+            return
+        if _pkg._PRELOAD["thread"] is None:
+            _pkg.preload_lance_stack(background=False)
+        _pkg.join_preload()
+    except Exception as exc:  # noqa: BLE001 - never block a fork
+        logger.debug("pre-fork Lance preload failed: %s", exc)
+    finally:
+        _FORK_PRELOAD["armed"] = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_preload_before_fork)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
 def _tensor_chw_to_hwc_uint8(frame: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -100,10 +189,13 @@ class LanceEpisodeLoader:
         revision: str | None = None,
         token: str | bool | None = None,
         use_mini_mp4: bool = True,
-        video_decoder_cache_size: int = 16,
+        video_decoder_cache_size: int = DEFAULT_VIDEO_DECODER_CACHE_SIZE,
         decoder_kwargs: dict[str, Any] | None = None,
         where: str | None = None,
         lance_version: int | None = None,
+        video_cache_dir: str | Path | None = None,
+        video_cache_gb: float | None = None,
+        video_cache_force_local: bool | None = None,
     ) -> None:
         self.dataset_path = str(dataset_path)
         self.repo_id = repo_id
@@ -117,33 +209,41 @@ class LanceEpisodeLoader:
         self.decoder_kwargs = decoder_kwargs
         self.where = where
         self.lance_version = int(lance_version) if lance_version is not None else None
+        # Effective MVCC snapshot of frames.lance for anchors, rows and stats: the explicit
+        # ``lance_version`` or, with ``where``, the version the predicate was evaluated at.
+        self.frames_version: int | None = self.lance_version
+        self.stats_snapshot: dict[str, Any] | None = None
+        # Startup accounting for benchmarks (time spent in isolated Lance child processes ...).
+        self.startup_info: dict[str, Any] = {"isolated_calls": 0, "isolated_wall_s": 0.0}
 
-        # Resolve metadata root once without constructing a throwaway LanceDBDataset
-        # (and without touching Lance/Tokio at all for local datasets or cached remote meta).
-        t_before_ns = time.time_ns()
-        _db_uri, resolved_root = resolve_lance_root(
-            repo_id=repo_id,
-            root=self.dataset_path,
-            storage_options=self.storage_options,
-            revision=self.revision,
-            token=self.token,
+        from .gop_cache import resolve_cache_config
+
+        self._video_cache_config = resolve_cache_config(
+            self.dataset_path,
+            cache_dir=video_cache_dir,
+            cache_gb=video_cache_gb,
+            force_local=video_cache_force_local,
         )
-        self.local_meta_root: Path = Path(resolved_root)
-        # If resolve_lance_root had to materialize remote meta/ from meta.lance in this
-        # process, lancedb's Rust/Tokio runtime was initialized here (not fork-safe).
+
+        _FORK_PRELOAD["armed"] = True
+        # Resolve the local meta/ root without starting Lance/Tokio in this process.
         self._meta_opened_lance_pid: int | None = None
-        if is_remote_uri(self.dataset_path):
-            meta_dir = self.local_meta_root / "meta"
-            try:
-                if meta_dir.stat().st_mtime_ns >= t_before_ns:
-                    self._meta_opened_lance_pid = os.getpid()
-            except OSError:
-                self._meta_opened_lance_pid = os.getpid()
+        self.local_meta_root: Path = self._resolve_meta_root()
+        meta_dir = self.local_meta_root / "meta"
+
+        # Frame-level SQL pushdown + version-pinned stats, computed out of process.
+        where_frames: tuple[np.ndarray, np.ndarray] | None = None
+        versioned_meta: dict[str, Any] | None = None
+        if self.where is not None:
+            where_frames, versioned_meta = self._query_where(self.where, self.lance_version)
+        effective_stats_path = self.stats_json_path
+        if effective_stats_path is None and self.frames_version is not None:
+            effective_stats_path = self._resolve_versioned_stats(meta_dir, self.frames_version, versioned_meta)
 
         bundle = load_gr00t_meta_bundle(
-            self.local_meta_root / "meta",
+            meta_dir,
             modality_json_path=self.modality_json_path,
-            stats_json_path=self.stats_json_path,
+            stats_json_path=effective_stats_path,
         )
         self.info_meta = bundle.info_meta
         self.modality_meta = bundle.modality_meta
@@ -229,69 +329,177 @@ class LanceEpisodeLoader:
 
         # Optional frame-level SQL predicate pushdown against frames.lance (zero video reads).
         self.valid_steps_by_episode: dict[int, np.ndarray] | None = None
-        if self.where is not None:
-            self.valid_steps_by_episode = self._resolve_valid_steps_from_where(
-                where=self.where,
-                lance_version=self.lance_version,
-            )
+        if where_frames is not None:
+            self.valid_steps_by_episode = self._group_valid_steps(*where_frames)
 
-    def _open_frames_table(self, lance_version: int | None = None) -> Any:
-        import lancedb
+    # -- metadata root / where / versioned stats (no Lance in this process) -------------
+    def _note_isolated(self, res: dict[str, Any]) -> None:
+        self.startup_info["isolated_calls"] += 1
+        self.startup_info["isolated_wall_s"] += float(res.get("_isolated_wall_s", 0.0))
 
-        opts = self.storage_options
-        db = lancedb.connect(self.dataset_path, storage_options=opts) if opts else lancedb.connect(self.dataset_path)
-        table = db.open_table(FRAMES_TABLE, **({"storage_options": opts} if opts else {}))
-        if lance_version is not None:
-            table.checkout(lance_version)
-        return table
+    def _isolated_kwargs(self) -> dict[str, Any]:
+        return {
+            "dataset_path": self.dataset_path,
+            "repo_id": self.repo_id,
+            "storage_options": self.storage_options,
+            "revision": self.revision,
+            "token": self.token,
+        }
 
-    def _resolve_valid_steps_from_where(
-        self,
-        *,
-        where: str,
-        lance_version: int | None = None,
-    ) -> dict[int, np.ndarray]:
-        """Query ``frames.lance`` projecting ONLY ``["episode_index", "frame_index"]`` with ``where``.
+    def _resolve_meta_root(self) -> Path:
+        path = self.dataset_path
+        if "://" not in path and self.repo_id is None:
+            root = Path(path)
+            if (root / f"{FRAMES_TABLE}.lance").exists():
+                return root
+            raise FileNotFoundError(f"No '{FRAMES_TABLE}.lance' table under {root}.")
+        if "://" in path:
+            cached = _remote_meta_cache_root(path, self.storage_options, self.revision, self.token)
+            if cached is not None and (cached / "meta").exists():
+                return cached
+            if cached is not None:
+                # Cold remote meta: materialize meta.lance -> meta/ in a child process so the
+                # main process stays Tokio-free and DataLoader workers can still use fork.
+                from ._isolated import run_isolated
 
-        NOTE: runs in the calling process, which starts lancedb's Tokio runtime here; it is
-        recorded so ``assert_unopened()`` refuses ``fork`` (see issue #1).
+                res = run_isolated("gr00t_lancedb.lance_query:materialize_meta", self._isolated_kwargs())
+                self._note_isolated(res)
+                return Path(res["local_root"])
+        # hf:// repo ids (or unexpected lerobot-lancedb internals): resolve in process.
+        from lerobot_lancedb.reader import resolve_lance_root
+
+        t_before_ns = time.time_ns()
+        _db_uri, resolved_root = resolve_lance_root(
+            repo_id=self.repo_id,
+            root=self.dataset_path,
+            storage_options=self.storage_options,
+            revision=self.revision,
+            token=self.token,
+        )
+        root = Path(resolved_root)
+        try:
+            if (root / "meta").stat().st_mtime_ns >= t_before_ns:
+                self._meta_opened_lance_pid = os.getpid()
+        except OSError:
+            self._meta_opened_lance_pid = os.getpid()
+        return root
+
+    def _where_cache_path(self, where: str, version: int) -> Path:
+        ident = json.dumps([self.dataset_path, self.repo_id, where, int(version)])
+        return _user_cache_dir() / "where" / f"{hashlib.sha256(ident.encode()).hexdigest()[:24]}.npz"
+
+    def _query_where(
+        self, where: str, lance_version: int | None
+    ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, Any] | None]:
+        """Matching ``(episode_index, frame_index)`` pairs for ``where`` at one version.
+
+        With an explicit version the result is immutable (MVCC), so it is cached on disk:
+        a resumed run after preemption skips the query entirely.
         """
-        self._meta_opened_lance_pid = os.getpid()
-        with _OPEN_LOCK:
-            table = self._open_frames_table(lance_version=lance_version)
-            arrow_tbl = (
-                table.search()
-                .where(where)
-                .select(["episode_index", "frame_index"])
-                .limit(None)
-                .to_arrow()
-            )
+        if lance_version is not None:
+            cache = self._where_cache_path(where, lance_version)
+            try:
+                with np.load(cache) as z:
+                    self.startup_info["where_cache_hit"] = True
+                    return (z["episode_index"], z["frame_index"]), None
+            except (OSError, KeyError, ValueError):
+                pass
+        from ._isolated import run_isolated
 
+        res = run_isolated(
+            "gr00t_lancedb.lance_query:query_where_anchors",
+            {**self._isolated_kwargs(), "where": where, "lance_version": lance_version},
+        )
+        self._note_isolated(res)
+        self.startup_info["where_cache_hit"] = False
+        self.frames_version = int(res["frames_version"])
+        ep, fr = np.asarray(res["episode_index"], np.int64), np.asarray(res["frame_index"], np.int64)
+        try:
+            cache = self._where_cache_path(where, self.frames_version)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_name(f".{cache.stem}.{os.getpid()}.tmp.npz")
+            np.savez(tmp, episode_index=ep, frame_index=fr)
+            os.replace(tmp, cache)
+        except OSError:
+            pass
+        return (ep, fr), res.get("versioned_meta")
+
+    def _resolve_versioned_stats(
+        self, meta_dir: Path, frames_version: int, versioned_meta: dict[str, Any] | None
+    ) -> str | None:
+        """Path of the ``gr00t_stats.json`` snapshot in force at ``frames_version`` (issue #2).
+
+        Source of truth is ``curation_versions.json`` in the latest ``meta.lance``. Local
+        datasets keep ``meta/`` in sync with it; for object-store datasets a possibly stale
+        local cache is refreshed from ``meta.lance`` through an isolated child.
+        """
+        local_manifest_path = meta_dir / CURATION_VERSIONS_FILENAME
+
+        def local_entry() -> dict[str, Any] | None:
+            try:
+                manifest = json.loads(local_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            entry = select_curation_entry(manifest, frames_version)
+            if entry and (meta_dir / entry["gr00t_stats"]).exists():
+                return entry
+            return None
+
+        entry = None
+        if versioned_meta is None:
+            entry = local_entry()
+            if entry is None and is_remote_uri(self.dataset_path):
+                from ._isolated import run_isolated
+
+                versioned_meta = run_isolated(
+                    "gr00t_lancedb.lance_query:fetch_versioned_meta",
+                    {**self._isolated_kwargs(), "frames_version": frames_version},
+                )
+                self._note_isolated(versioned_meta)
+        if entry is None and versioned_meta is not None:
+            if versioned_meta.get("manifest"):
+                _atomic_write_bytes(local_manifest_path, versioned_meta["manifest"])
+            for name, data in (versioned_meta.get("files") or {}).items():
+                if data is not None:
+                    _atomic_write_bytes(meta_dir / name, data)
+            entry = local_entry()
+        if entry is None:
+            logger.info(
+                "No curation stats snapshot for frames.lance v%s in %s; using default stats.",
+                frames_version,
+                self.dataset_path,
+            )
+            return None
+        self.stats_snapshot = dict(entry)
+        if int(entry.get("frames_version", frames_version)) < frames_version:
+            logger.info(
+                "frames.lance v%s was not produced by curation; using the newest snapshot (v%s).",
+                frames_version,
+                entry.get("frames_version"),
+            )
+        return str(meta_dir / entry["gr00t_stats"])
+
+    def _group_valid_steps(self, ep_arr: np.ndarray, frame_arr: np.ndarray) -> dict[int, np.ndarray]:
+        """Per positional episode: sorted unique matching anchor frame indices."""
         valid_by_pos: dict[int, np.ndarray] = {
             pos: np.empty(0, dtype=np.int64) for pos in range(len(self.episodes_metadata))
         }
-        if arrow_tbl.num_rows == 0:
+        if len(ep_arr) == 0:
             return valid_by_pos
-
-        ep_arr = arrow_tbl.column("episode_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-        frame_arr = arrow_tbl.column("frame_index").combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-
         order = np.lexsort((frame_arr, ep_arr))
         ep_sorted = ep_arr[order]
         frame_sorted = frame_arr[order]
         unique_eps, split_starts = np.unique(ep_sorted, return_index=True)
         split_ends = np.append(split_starts[1:], len(ep_sorted))
-
-        for ep_id_np, s, e in zip(unique_eps, split_starts, split_ends, strict=True):
+        for ep_id_np, lo_i, hi_i in zip(unique_eps, split_starts, split_ends, strict=True):
             pos = self._ep_id_to_pos.get(int(ep_id_np))
             if pos is None:
                 continue
-            ep_frames = np.unique(frame_sorted[s:e])
+            ep_frames = np.unique(frame_sorted[lo_i:hi_i])
             ep_len = self.episode_lengths[pos]
-            if len(ep_frames):
-                lo = int(np.searchsorted(ep_frames, 0, side="left"))
-                hi = int(np.searchsorted(ep_frames, ep_len, side="left"))
-                valid_by_pos[pos] = np.ascontiguousarray(ep_frames[lo:hi], dtype=np.int64)
+            lo = int(np.searchsorted(ep_frames, 0, side="left"))
+            hi = int(np.searchsorted(ep_frames, ep_len, side="left"))
+            valid_by_pos[pos] = np.ascontiguousarray(ep_frames[lo:hi], dtype=np.int64)
         return valid_by_pos
 
     def get_valid_steps_for_episode(
@@ -349,6 +557,8 @@ class LanceEpisodeLoader:
         """Return an open ``LanceDBDataset``; caller MUST hold ``self._io_lock``."""
         r = self._reader0
         if r is None:
+            from lerobot_lancedb import LanceDBDataset
+
             r = LanceDBDataset(**self._reader_kwargs)
             self._reader0 = r
         needs_open = getattr(r, "_frames_perm", None) is None or (
@@ -362,17 +572,35 @@ class LanceEpisodeLoader:
                 if getattr(r, "_frames_perm", None) is not None:
                     r._frames_perm = None
                 r._ensure_open()
-                if self.lance_version is not None:
-                    from lancedb.permutation import Permutation
+                if self.frames_version is not None:
+                    self._pin_frames_version(r, self.frames_version)
+                if getattr(r, "_videos_table", None) is not None:
+                    from .gop_cache import wrap_videos_table
 
-                    pinned_table = self._open_frames_table(lance_version=self.lance_version)
-                    r._frames_perm = (
-                        Permutation.identity(pinned_table)
-                        .select_columns(r._fetch_columns)
-                        .with_format("arrow")
+                    wrap_videos_table(
+                        r,
+                        dataset_id=str(getattr(r, "_db_uri", self.dataset_path)),
+                        cache_config=self._video_cache_config,
                     )
             self._opened_pid = os.getpid()
         return r
+
+    @staticmethod
+    def _pin_frames_version(r: LanceDBDataset, version: int) -> None:
+        """Point the reader's row permutation at one MVCC snapshot of ``frames.lance``."""
+        from lancedb.permutation import Permutation
+        from lerobot_lancedb.reader import _connect, _open_table
+
+        options = getattr(r, "_storage_options", None)
+        table = _open_table(_connect(r._db_uri, options), FRAMES_TABLE, options or None)
+        table.checkout(int(version))
+        n_rows = table.count_rows()
+        if n_rows != r.meta.total_frames:
+            raise ValueError(
+                f"frames.lance v{version} has {n_rows} rows but meta declares "
+                f"{r.meta.total_frames}; cannot pin a version with a different row count."
+            )
+        r._frames_perm = Permutation.identity(table).select_columns(r._fetch_columns).with_format("arrow")
 
     def _episode_bounds(self, episode_id: int) -> tuple[int, int]:
         bounds = self._ep_bounds_cache.get(episode_id)
@@ -495,6 +723,10 @@ class LanceEpisodeLoader:
 
         decoded_videos: dict[int, dict[str, np.ndarray]] = {}
         decoded_list: list[dict[str, Any]] = []
+        if all_rows:
+            from .gop_cache import IO_STATS
+
+            IO_STATS.add(frames_take_calls=1, frames_take_rows=len(all_rows))
         with self._io_lock:
             reader = self._ensure_reader_locked()
             if video_abs_rows and self._video_orig_keys:

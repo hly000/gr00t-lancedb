@@ -32,11 +32,14 @@ from lerobot_lancedb.convert import _connect_output
 
 from .metadata import (
     CURATION_REPORT_FILENAME,
+    CURATION_VERSIONS_FILENAME,
+    CURATION_VERSIONS_FORMAT,
     DEFAULT_COLUMN_NAMES,
     GROOT_STATS_FILENAME,
     LEROBOT_MODALITY_FILENAME,
     LEROBOT_STATS_FILENAME,
     compute_gr00t_stats_from_arrays,
+    versioned_meta_filename,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,12 @@ class CurationReport:
     files_written_frames: int
     files_written_videos: int
     scalar_indexes_built: list[str]
+    # MVCC bookkeeping (issue #2): versions [frames_version_from, frames_table_version] of
+    # frames.lance carry this run's columns; their stats live in gr00t_stats_v<N>.json.
+    frames_version_from: int = 0
+    meta_table_version_before: int = 0
+    meta_table_version: int = 0
+    stats_snapshot_file: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -210,6 +219,7 @@ def curate_lance_dataset(
     frames_table = db.open_table(FRAMES_TABLE, **open_kw)
     meta_table = db.open_table(META_TABLE, **open_kw)
     version_before = int(frames_table.version)
+    meta_version_before = int(meta_table.version)
 
     # 1. Read existing metadata entries from meta.lance (zero video reads)
     meta_arrow = meta_table.search().select(["path", "data"]).limit(None).to_arrow()
@@ -221,6 +231,9 @@ def curate_lance_dataset(
             strict=True,
         )
     }
+
+    original_entries = dict(entries)
+    manifest = _load_or_init_manifest(entries, version_before)
 
     if LEROBOT_MODALITY_FILENAME in entries:
         modality_meta = json.loads(entries[LEROBOT_MODALITY_FILENAME].decode("utf-8"))
@@ -389,6 +402,42 @@ def curate_lance_dataset(
                 json.dumps(existing_v3_stats, indent=2) + "\n"
             ).encode("utf-8")
 
+    # 6b. Version-keyed snapshot of the stats now in force (kept forever, MVCC-style).
+    snap_names = {
+        "gr00t_stats": versioned_meta_filename("gr00t_stats", version_after),
+        "stats": versioned_meta_filename("stats", version_after),
+        "report": versioned_meta_filename("report", version_after),
+    }
+    preferred = entries.get(GROOT_STATS_FILENAME) or entries.get(LEROBOT_STATS_FILENAME)
+    if preferred is not None:
+        entries[snap_names["gr00t_stats"]] = preferred
+    if LEROBOT_STATS_FILENAME in entries:
+        entries[snap_names["stats"]] = entries[LEROBOT_STATS_FILENAME]
+    manifest["entries"] = [
+        e for e in manifest["entries"] if int(e.get("frames_version", -1)) != version_after
+    ] + [
+        {
+            "kind": "curation",
+            "frames_version_from": version_before + 1,
+            "frames_version": version_after,
+            "gr00t_stats": snap_names["gr00t_stats"] if preferred is not None else None,
+            "stats": snap_names["stats"] if LEROBOT_STATS_FILENAME in entries else None,
+            "report": snap_names["report"],
+            "meta_table_version_before": meta_version_before,
+            "params": {
+                "idle_eps": float(idle_eps),
+                "spike_threshold": float(spike_threshold) if spike_threshold is not None else None,
+                "drop_episodes": sorted(int(e) for e in (drop_episodes or [])),
+                "drop_random_frac": float(drop_random_frac),
+                "drop_seed": int(drop_seed),
+                "keep_idle": bool(keep_idle),
+                "recompute_stats": bool(recompute_stats),
+            },
+            "created_unix_s": round(time.time(), 3),
+        }
+    ]
+    entries[CURATION_VERSIONS_FILENAME] = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+
     # 7. Assemble report and persist to meta.lance (+ local meta/ if local)
     total_episodes = int(len(unique_eps))
     bad_episodes = int(len(bad_ep_set))
@@ -430,24 +479,29 @@ def curate_lance_dataset(
         files_written_frames=files_written_frames,
         files_written_videos=0,
         scalar_indexes_built=scalar_indexes_built,
+        frames_version_from=version_before + 1,
+        meta_table_version_before=meta_version_before,
+        meta_table_version=meta_version_before + 1,
+        stats_snapshot_file=snap_names["gr00t_stats"] if preferred is not None else None,
     )
 
-    entries[CURATION_REPORT_FILENAME] = (json.dumps(report.to_dict(), indent=2) + "\n").encode("utf-8")
+    report_bytes = (json.dumps(report.to_dict(), indent=2) + "\n").encode("utf-8")
+    entries[CURATION_REPORT_FILENAME] = report_bytes
+    entries[snap_names["report"]] = report_bytes
 
-    meta_schema = pa.schema([pa.field("path", pa.string()), pa.field("data", pa.large_binary())])
-    db.create_table(
-        META_TABLE,
-        pa.Table.from_pylist(
-            [{"path": p, "data": entries[p]} for p in sorted(entries)],
-            schema=meta_schema,
-        ),
-        mode="overwrite",
-    )
+    changed = {p: d for p, d in entries.items() if original_entries.get(p) != d}
+    report.meta_table_version = _upsert_meta_entries(db, meta_table, changed, entries)
 
     if local_root is not None:
         local_meta = local_root / "meta"
         local_meta.mkdir(parents=True, exist_ok=True)
-        for fname in (GROOT_STATS_FILENAME, LEROBOT_STATS_FILENAME, CURATION_REPORT_FILENAME):
+        for fname in (
+            GROOT_STATS_FILENAME,
+            LEROBOT_STATS_FILENAME,
+            CURATION_REPORT_FILENAME,
+            CURATION_VERSIONS_FILENAME,
+            *[n for n in changed if n.startswith(("gr00t_stats_v", "stats_v", "curation_report_v"))],
+        ):
             if fname in entries:
                 (local_meta / fname).write_bytes(entries[fname])
 
@@ -466,15 +520,86 @@ def curate_lance_dataset(
         report.wall_time_s = round(time.perf_counter() - t0, 4)
 
         # Keep local curation_report.json synced with final measured byte/time totals
-        (local_meta / CURATION_REPORT_FILENAME).write_text(
-            json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8"
-        )
+        final_report = json.dumps(report.to_dict(), indent=2) + "\n"
+        (local_meta / CURATION_REPORT_FILENAME).write_text(final_report, encoding="utf-8")
+        (local_meta / snap_names["report"]).write_text(final_report, encoding="utf-8")
     else:
-        report.bytes_written_meta = sum(len(v) for v in entries.values())
+        report.bytes_written_meta = sum(len(v) for v in changed.values())
         report.bytes_written_total = report.bytes_written_frames + report.bytes_written_meta
         report.wall_time_s = round(time.perf_counter() - t0, 4)
 
     return report
+
+
+def _load_or_init_manifest(entries: dict[str, bytes], version_before: int) -> dict[str, Any]:
+    """Load ``curation_versions.json`` or seed it with the pre-curation stats snapshot.
+
+    On the first curation the stats currently in ``meta.lance`` are those of versions
+    ``1..version_before``; they are copied to ``gr00t_stats_v<version_before>.json`` so a
+    run pinned to the raw data still gets the raw-data statistics.
+    """
+    raw = entries.get(CURATION_VERSIONS_FILENAME)
+    if raw is not None:
+        manifest = json.loads(raw.decode("utf-8"))
+        manifest.setdefault("entries", [])
+        return manifest
+    manifest: dict[str, Any] = {"format": CURATION_VERSIONS_FORMAT, "entries": []}
+    preferred = entries.get(GROOT_STATS_FILENAME) or entries.get(LEROBOT_STATS_FILENAME)
+    legacy_report = entries.get(CURATION_REPORT_FILENAME)
+    if legacy_report is not None:
+        # Curated by a version of this tool that predates the manifest: the stats on disk
+        # belong to that curation run, and the raw-data stats are gone.
+        try:
+            rep = json.loads(legacy_report.decode("utf-8"))
+            start = int(rep.get("frames_table_version_before", 0)) + 1
+            end = int(rep.get("frames_table_version", version_before))
+        except (ValueError, TypeError):
+            start, end = 1, version_before
+        kind = "legacy_curation"
+    else:
+        start, end, kind = 1, version_before, "original"
+    entry: dict[str, Any] = {"kind": kind, "frames_version_from": start, "frames_version": end}
+    if preferred is not None:
+        name = versioned_meta_filename("gr00t_stats", end)
+        entries[name] = preferred
+        entry["gr00t_stats"] = name
+    if LEROBOT_STATS_FILENAME in entries:
+        name = versioned_meta_filename("stats", end)
+        entries[name] = entries[LEROBOT_STATS_FILENAME]
+        entry["stats"] = name
+    if entry.get("gr00t_stats"):
+        manifest["entries"].append(entry)
+    return manifest
+
+
+def _upsert_meta_entries(db: Any, meta_table: Any, changed: dict[str, bytes], entries: dict[str, bytes]) -> int:
+    """Write only changed ``meta.lance`` rows as one new table version (history preserved).
+
+    Falls back to a full overwrite (also a new version; older versions stay readable via
+    ``checkout``) if this LanceDB build lacks ``merge_insert``.
+    """
+    meta_schema = pa.schema([pa.field("path", pa.string()), pa.field("data", pa.large_binary())])
+    if not changed:
+        return int(meta_table.version)
+    rows = pa.Table.from_pylist(
+        [{"path": p, "data": changed[p]} for p in sorted(changed)], schema=meta_schema
+    )
+    try:
+        (
+            meta_table.merge_insert("path")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(rows)
+        )
+        return int(meta_table.version)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("meta.lance merge_insert failed (%s); rewriting the table instead.", exc)
+        tbl = db.create_table(
+            META_TABLE,
+            pa.Table.from_pylist([{"path": p, "data": entries[p]} for p in sorted(entries)], schema=meta_schema),
+            mode="overwrite",
+        )
+        return int(tbl.version)
 
 
 def _parse_drop_episodes(raw: str | None) -> list[int] | None:
