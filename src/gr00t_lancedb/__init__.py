@@ -11,13 +11,18 @@ background via :func:`preload_lance_stack`.
 from __future__ import annotations
 
 from importlib import import_module
+import os as _os
 import threading
 from typing import TYPE_CHECKING, Any
 
 # Must run before anything imports lerobot / lerobot_lancedb (see _hub_compat docstring).
 from ._hub_compat import ensure_hub_compat
 
-ensure_hub_compat()
+# The short-lived Lance child (``_isolated``) mostly runs plain lancedb queries; it calls
+# ensure_hub_compat() itself right before the few code paths that import lerobot, so the
+# common case does not pay for importing huggingface_hub.
+if _os.environ.get("GR00T_LANCE_ISOLATED_CHILD") != "1":
+    ensure_hub_compat()
 
 __version__ = "0.1.0"
 
@@ -74,7 +79,18 @@ _LAZY: dict[str, str] = {
     "mine_rare_frames": ".vector_curate",
 }
 
-__all__ = sorted([*_LAZY, "__version__", "preload_lance_stack", "join_preload"])
+__all__ = sorted([*_LAZY, "__version__", "preload_lance_stack", "join_preload", "prefetch_lance_startup"])
+
+
+def prefetch_lance_startup(*args: Any, **kwargs: Any) -> list[str]:
+    """Start the dataset's startup Lance queries now, in child processes.
+
+    See :func:`gr00t_lancedb._startup.prefetch_lance_startup`. Call it before loading the
+    model so the queries overlap with it instead of running one after the other.
+    """
+    from ._startup import prefetch_lance_startup as _impl
+
+    return _impl(*args, **kwargs)
 
 
 def __getattr__(name: str) -> Any:

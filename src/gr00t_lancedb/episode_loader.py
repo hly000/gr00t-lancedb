@@ -26,6 +26,15 @@ import pandas as pd
 import torch
 
 from ._gr00t_compat import EmbodimentTag, ModalityConfig, VLAStepData
+from ._startup import (
+    FETCH_VERSIONED_META,
+    MATERIALIZE_META,
+    QUERY_WHERE,
+    isolated_kwargs,
+    needs_meta_child,
+    where_cache_path,
+    where_kwargs,
+)
 from .metadata import (
     CURATION_VERSIONS_FILENAME,
     DEFAULT_COLUMN_NAMES,
@@ -56,13 +65,6 @@ def is_remote_uri(path: str | Path) -> bool:
     """``s3://``, ``gs://``, ``hf://`` ... (``file://`` counts as local)."""
     raw = str(path)
     return "://" in raw and not raw.startswith("file://")
-
-
-def _user_cache_dir() -> Path:
-    base = os.environ.get("GR00T_LANCE_CACHE_DIR")
-    if base:
-        return Path(base)
-    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "gr00t_lancedb"
 
 
 def _remote_meta_cache_root(
@@ -218,8 +220,14 @@ class LanceEpisodeLoader:
         # ``lance_version`` or, with ``where``, the version the predicate was evaluated at.
         self.frames_version: int | None = self.lance_version
         self.stats_snapshot: dict[str, Any] | None = None
-        # Startup accounting for benchmarks (time spent in isolated Lance child processes ...).
-        self.startup_info: dict[str, Any] = {"isolated_calls": 0, "isolated_wall_s": 0.0}
+        # Startup accounting for benchmarks: ``isolated_wall_s`` is how long the Lance child
+        # processes ran, ``isolated_wait_s`` how long this constructor actually waited for
+        # them (much less when prefetch_lance_startup() started them during model loading).
+        self.startup_info: dict[str, Any] = {
+            "isolated_calls": 0,
+            "isolated_wall_s": 0.0,
+            "isolated_wait_s": 0.0,
+        }
 
         from .gop_cache import resolve_cache_config
 
@@ -339,17 +347,13 @@ class LanceEpisodeLoader:
 
     # -- metadata root / where / versioned stats (no Lance in this process) -------------
     def _note_isolated(self, res: dict[str, Any]) -> None:
+        wall = float(res.get("_isolated_wall_s") or 0.0)
         self.startup_info["isolated_calls"] += 1
-        self.startup_info["isolated_wall_s"] += float(res.get("_isolated_wall_s", 0.0))
+        self.startup_info["isolated_wall_s"] += wall
+        self.startup_info["isolated_wait_s"] += float(res.get("_isolated_wait_s", wall) or 0.0)
 
     def _isolated_kwargs(self) -> dict[str, Any]:
-        return {
-            "dataset_path": self.dataset_path,
-            "repo_id": self.repo_id,
-            "storage_options": self.storage_options,
-            "revision": self.revision,
-            "token": self.token,
-        }
+        return isolated_kwargs(self.dataset_path, self.repo_id, self.storage_options, self.revision, self.token)
 
     def _resolve_meta_root(self) -> Path:
         path = self.dataset_path
@@ -359,15 +363,22 @@ class LanceEpisodeLoader:
                 return root
             raise FileNotFoundError(f"No '{FRAMES_TABLE}.lance' table under {root}.")
         if "://" in path:
+            from ._isolated import is_started, run_isolated
+
+            if needs_meta_child(path, self.repo_id) and is_started(MATERIALIZE_META, self._isolated_kwargs()):
+                # prefetch_lance_startup() already has a child resolving (and, on a cold
+                # cache, filling) meta/. Taking its answer also keeps lerobot-lancedb out of
+                # this process: the cache path below can only be computed by importing it.
+                res = run_isolated(MATERIALIZE_META, self._isolated_kwargs())
+                self._note_isolated(res)
+                return Path(res["local_root"])
             cached = _remote_meta_cache_root(path, self.storage_options, self.revision, self.token)
             if cached is not None and (cached / "meta").exists():
                 return cached
             if cached is not None:
                 # Cold remote meta: materialize meta.lance -> meta/ in a child process so the
                 # main process stays Tokio-free and DataLoader workers can still use fork.
-                from ._isolated import run_isolated
-
-                res = run_isolated("gr00t_lancedb.lance_query:materialize_meta", self._isolated_kwargs())
+                res = run_isolated(MATERIALIZE_META, self._isolated_kwargs())
                 self._note_isolated(res)
                 return Path(res["local_root"])
         # hf:// repo ids (or unexpected lerobot-lancedb internals): resolve in process.
@@ -390,8 +401,7 @@ class LanceEpisodeLoader:
         return root
 
     def _where_cache_path(self, where: str, version: int) -> Path:
-        ident = json.dumps([self.dataset_path, self.repo_id, where, int(version)])
-        return _user_cache_dir() / "where" / f"{hashlib.sha256(ident.encode()).hexdigest()[:24]}.npz"
+        return where_cache_path(self.dataset_path, self.repo_id, where, version)
 
     def _query_where(
         self, where: str, lance_version: int | None
@@ -411,10 +421,7 @@ class LanceEpisodeLoader:
                 pass
         from ._isolated import run_isolated
 
-        res = run_isolated(
-            "gr00t_lancedb.lance_query:query_where_anchors",
-            {**self._isolated_kwargs(), "where": where, "lance_version": lance_version},
-        )
+        res = run_isolated(QUERY_WHERE, where_kwargs(self._isolated_kwargs(), where, lance_version))
         self._note_isolated(res)
         self.startup_info["where_cache_hit"] = False
         self.frames_version = int(res["frames_version"])
@@ -457,8 +464,7 @@ class LanceEpisodeLoader:
                 from ._isolated import run_isolated
 
                 versioned_meta = run_isolated(
-                    "gr00t_lancedb.lance_query:fetch_versioned_meta",
-                    {**self._isolated_kwargs(), "frames_version": frames_version},
+                    FETCH_VERSIONED_META, {**self._isolated_kwargs(), "frames_version": frames_version}
                 )
                 self._note_isolated(versioned_meta)
         if entry is None and versioned_meta is not None:

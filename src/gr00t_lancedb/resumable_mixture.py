@@ -607,6 +607,9 @@ class ResumableLanceMixtureDataset(IterableDataset):
         return results
 
     def __iter__(self) -> Iterator[Any]:
+        from ._worker_exit import arm_worker_fast_exit
+
+        arm_worker_fast_exit()
         worker = get_worker_info()
         num_workers, phys_worker_id = (worker.num_workers, worker.id) if worker else (1, 0)
 

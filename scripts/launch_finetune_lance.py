@@ -27,6 +27,11 @@ Key v1 performance / ablation env vars:
   so batch 0 decodes while the checkpoint loads; ``1`` / ``0`` force)
 - ``GR00T_LANCE_BG_IMPORT`` (default ``1``: import lerobot-lancedb on a background thread
   while GR00T loads the model; joined before the first fork)
+- ``GR00T_LANCE_PREFETCH`` (default ``1``: start the dataset's startup Lance queries - cold
+  remote ``meta.lance`` and the ``where`` predicate - in child processes before importing
+  GR00T, so they run while the model loads instead of after it)
+- ``GR00T_LANCE_WORKER_FAST_EXIT`` (default ``1``: DataLoader workers leave with
+  ``os._exit`` when training ends instead of joining their decode threads)
 - ``GR00T_LANCE_AUTO_PIN`` (default ``1``: remember the frames.lance version a ``where``
   query ran at in ``<output_dir>/lance_pins.json`` and reuse it on resume)
 - ``GR00T_SAMPLE_FINGERPRINTS`` (default ``0``: ``1`` logs one hash per sample per step)
@@ -257,7 +262,9 @@ _STARTUP_KEYS = (
     "dataloader_create_s",
     "lance_preload_s",
     "lance_isolated_s",
+    "lance_isolated_wait_s",
     "lance_isolated_calls",
+    "lance_prefetch",
     "lance_where_cache_hit",
     "lance_frames_version",
     "mp_ctx",
@@ -683,7 +690,13 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
     auto_pin = os.environ.get("GR00T_LANCE_AUTO_PIN", "1") == "1"
     pins = _load_lance_pins(_RUN["output_dir"]) if (auto_pin and backend == "lance") else {}
     new_pins: dict[str, int] = {}
-    lance_stats = {"isolated_s": 0.0, "isolated_calls": 0, "where_cache_hit": None, "versions": {}}
+    lance_stats = {
+        "isolated_s": 0.0,
+        "isolated_wait_s": 0.0,
+        "isolated_calls": 0,
+        "where_cache_hit": None,
+        "versions": {},
+    }
 
     all_datasets, all_weights = [], []
     for spec in cfg.data.datasets:
@@ -711,6 +724,7 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
                 ds = LanceShardedSingleStepDataset(**lance_kw)
                 info = ds.episode_loader.startup_info
                 lance_stats["isolated_s"] += float(info.get("isolated_wall_s", 0.0))
+                lance_stats["isolated_wait_s"] += float(info.get("isolated_wait_s", 0.0))
                 lance_stats["isolated_calls"] += int(info.get("isolated_calls", 0))
                 if "where_cache_hit" in info:
                     lance_stats["where_cache_hit"] = bool(info["where_cache_hit"])
@@ -737,7 +751,11 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
 
     if backend == "lance":
         phases = _RUN["phases"]
+        # isolated_s: how long the Lance child processes ran in total. isolated_wait_s: how
+        # much of that the dataset build actually waited for (the rest overlapped the model
+        # load when GR00T_LANCE_PREFETCH started them early).
         phases["lance_isolated_s"] = round(lance_stats["isolated_s"], 3)
+        phases["lance_isolated_wait_s"] = round(lance_stats["isolated_wait_s"], 3)
         phases["lance_isolated_calls"] = lance_stats["isolated_calls"]
         if lance_stats["where_cache_hit"] is not None:
             phases["lance_where_cache_hit"] = lance_stats["where_cache_hit"]
@@ -773,6 +791,45 @@ def _exact_build(self, processor, backend: str):  # bound as DatasetFactory.buil
         prefetch_batches=prefetch_batches,
     )
     return mix, None
+
+
+def _dataset_paths_from_args(gr00t_args: list[str]) -> list[str]:
+    """Dataset paths as ``launch_finetune.py`` will see them (``--dataset-path a:b``)."""
+    raw: str | None = None
+    for i, arg in enumerate(gr00t_args):
+        for flag in ("--dataset-path", "--dataset_path"):
+            if arg == flag and i + 1 < len(gr00t_args):
+                raw = gr00t_args[i + 1]
+            elif arg.startswith(flag + "="):
+                raw = arg.split("=", 1)[1]
+    if not raw:
+        return []
+    return [str(p) for p in _rejoin_uris(raw.split(os.pathsep)) if str(p)]
+
+
+def _start_lance_prefetch(gr00t_args: list[str], output_dir: Path) -> list[str]:
+    """Start the Lance startup queries now so they overlap GR00T's import and model load.
+
+    Mirrors the arguments ``_exact_build`` passes to ``LanceShardedSingleStepDataset``; if
+    they ever differ, the early call is simply not picked up and the loader runs its own.
+    """
+    paths = _dataset_paths_from_args(gr00t_args)
+    if not paths:
+        return []
+    from gr00t_lancedb import prefetch_lance_startup
+
+    version_raw = os.environ.get("GR00T_LANCE_VERSION")
+    auto_pin = os.environ.get("GR00T_LANCE_AUTO_PIN", "1") == "1"
+    try:
+        return prefetch_lance_startup(
+            paths,
+            where=os.environ.get("GR00T_LANCE_WHERE") or None,
+            lance_version=int(version_raw) if version_raw else None,
+            lance_versions=_load_lance_pins(output_dir) if auto_pin else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - an optimisation must never stop the launch
+        logger.warning("Lance startup prefetch failed (%s); the dataset build will query instead.", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +910,9 @@ def main() -> None:
         os.environ.setdefault(
             "GR00T_LANCE_IO_STATS_DIR", str(run_output_dir / "io_stats" / f"run-{int(launch_t0)}-{os.getpid()}")
         )
+
+    if backend == "lance" and os.environ.get("GR00T_LANCE_PREFETCH", "1") == "1":
+        phase_box["lance_prefetch"] = _start_lance_prefetch(gr00t_args, run_output_dir)
 
     t_imp0 = time.time()
     import gr00t.experiment.experiment as gexp
