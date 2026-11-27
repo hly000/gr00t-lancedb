@@ -67,8 +67,11 @@ def _build_processor_and_dataset(
     )
     stats = ds.get_dataset_statistics()
     # Load the EXACT pretrained processor from base_model_path (preserving use_relative_action,
-    # action_configs, embodiment_id mapping, etc.) rather than constructing a fresh one!
+    # embodiment_id mapping, etc.) and register libero_sim modality_configs + dataset statistics.
     processor = Gr00tN1d7Processor.from_pretrained(base_model_path)
+    processor.modality_configs[tag.value] = modality_configs
+    if hasattr(processor, "state_action_processor") and hasattr(processor.state_action_processor, "modality_configs"):
+        processor.state_action_processor.modality_configs[tag.value] = modality_configs
     processor.set_statistics({tag.value: stats})
     processor.state_dropout_prob = state_dropout_prob
     collator = Gr00tN1d7DataCollator(
