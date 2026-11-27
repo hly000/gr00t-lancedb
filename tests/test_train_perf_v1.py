@@ -471,12 +471,21 @@ def test_preempt_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GR00T_PREEMPT_LIGHT_CKPT", raising=False)
     monkeypatch.delenv("GR00T_PREEMPT_EST_SAVE_S", raising=False)
 
+    monkeypatch.delenv("GR00T_PREEMPT_CKPT_DTYPE", raising=False)
+    monkeypatch.delenv("GR00T_PREEMPT_DEADLINE_S", raising=False)
+    monkeypatch.delenv("GR00T_PREEMPT_PRIOR_WRITE_MBPS", raising=False)
+
     cb_light = _make_preempt_callback(_FakeMonitor(), exit_on_preempt=False)
     assert cb_light.cost_gate is True
     assert cb_light.light_ckpt is True
-    assert cb_light.est_save_s == 10.0
+    # No hard-coded estimate any more: the save time is payload_bytes / calibrated bandwidth.
+    assert cb_light.est_save_s is None
+    assert cb_light.ckpt_dtype == "auto"
+    assert cb_light.deadline_s == 25.0
+    assert cb_light.estimate_save_s(400_000_000) == pytest.approx(1.0 + 1.0)  # 400 MB @ 400 MB/s prior
 
     monkeypatch.setenv("GR00T_PREEMPT_LIGHT_CKPT", "0")
+    monkeypatch.setenv("GR00T_PREEMPT_EST_SAVE_S", "55")
     cb_full = _make_preempt_callback(_FakeMonitor(), exit_on_preempt=False)
     assert cb_full.light_ckpt is False
     assert cb_full.est_save_s == 55.0
