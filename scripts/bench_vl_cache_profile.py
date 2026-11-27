@@ -55,6 +55,31 @@ def _reset_gpu() -> None:
         torch.cuda.synchronize()
 
 
+def _build_gr00t_processor(cfg: Any, tag: Any, modality_configs: dict[str, Any], stats: Any = None) -> Any:
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+    return Gr00tN1d7Processor(
+        modality_configs={tag.value: modality_configs},
+        statistics=stats,
+        use_percentiles=getattr(cfg, "use_percentiles", True),
+        image_crop_size=getattr(cfg, "image_crop_size", None),
+        image_target_size=getattr(cfg, "image_target_size", None),
+        shortest_image_edge=getattr(cfg, "shortest_image_edge", 256),
+        crop_fraction=getattr(cfg, "crop_fraction", 0.95),
+        random_rotation_angle=getattr(cfg, "random_rotation_angle", None),
+        color_jitter_params=getattr(cfg, "color_jitter_params", None),
+        formalize_language=getattr(cfg, "formalize_language", True),
+        model_name=cfg.model_name,
+        model_type=cfg.backbone_model_type,
+        max_state_dim=cfg.max_state_dim,
+        max_action_dim=cfg.max_action_dim,
+        max_action_horizon=cfg.action_horizon,
+        apply_sincos_state_encoding=getattr(cfg, "apply_sincos_state_encoding", False),
+        use_albumentations=getattr(cfg, "use_albumentations", True),
+        use_relative_action=getattr(cfg, "use_relative_action", False),
+    )
+
+
 def _load_real_batches(
     dataset_path: str,
     base_model_path: str,
@@ -67,32 +92,12 @@ def _load_real_batches(
     import torch
     from transformers import AutoConfig
     from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
-    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator, Gr00tN1d7Processor
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
     from gr00t_lancedb._gr00t_compat import coerce_embodiment_tag
 
     cfg = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     tag = coerce_embodiment_tag(embodiment_tag)
     modality_configs = MODALITY_CONFIGS[tag.value]
-
-    processor = Gr00tN1d7Processor(
-        modality_configs=modality_configs,
-        statistics=None,
-        image_target_size=cfg.image_target_size,
-        image_crop_size=cfg.image_crop_size,
-        random_rotation_angle=cfg.random_rotation_angle,
-        color_jitter_params=cfg.color_jitter_params,
-        use_albumentations_transforms=getattr(cfg, "use_albumentations_transforms", True),
-        formalize_language=cfg.formalize_language,
-        apply_sincos_state_encoding=cfg.apply_sincos_state_encoding,
-        use_percentiles=cfg.use_percentiles,
-        use_relative_action=cfg.use_relative_action,
-        max_state_dim=cfg.max_state_dim,
-        max_action_dim=cfg.max_action_dim,
-        action_horizon=cfg.action_horizon,
-        state_history_length=cfg.state_history_length,
-        model_name=cfg.model_name,
-        backbone_model_type=cfg.backbone_model_type,
-    )
 
     is_lance = (Path(dataset_path) / "frames.lance").exists() or str(dataset_path).startswith(("s3://", "gs://"))
     if is_lance:
@@ -119,7 +124,7 @@ def _load_real_batches(
         )
 
     stats = ds.get_dataset_statistics()
-    processor.set_statistics(stats)
+    processor = _build_gr00t_processor(cfg, tag, modality_configs, stats=stats)
     processor.train()
     ds.processor = processor
 
@@ -463,25 +468,7 @@ def cmd_materialize(args: argparse.Namespace) -> dict[str, Any]:
         seed=42,
     )
     stats = ds.get_dataset_statistics()
-    processor = Gr00tN1d7Processor(
-        modality_configs=modality_configs,
-        statistics=stats,
-        image_target_size=cfg.image_target_size,
-        image_crop_size=cfg.image_crop_size,
-        random_rotation_angle=cfg.random_rotation_angle,
-        color_jitter_params=cfg.color_jitter_params,
-        use_albumentations_transforms=getattr(cfg, "use_albumentations_transforms", True),
-        formalize_language=cfg.formalize_language,
-        apply_sincos_state_encoding=cfg.apply_sincos_state_encoding,
-        use_percentiles=cfg.use_percentiles,
-        use_relative_action=cfg.use_relative_action,
-        max_state_dim=cfg.max_state_dim,
-        max_action_dim=cfg.max_action_dim,
-        action_horizon=cfg.action_horizon,
-        state_history_length=cfg.state_history_length,
-        model_name=cfg.model_name,
-        backbone_model_type=cfg.backbone_model_type,
-    )
+    processor = _build_gr00t_processor(cfg, tag, modality_configs, stats=stats)
     if args.views <= 1:
         processor.eval()  # Deterministic center crop for view_id=0
     else:
