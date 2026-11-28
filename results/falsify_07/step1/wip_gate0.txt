@@ -1,0 +1,68 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.15, pytest-9.2.0, pluggy-1.7.0
+rootdir: /data/branch-falsify-wip
+configfile: pyproject.toml
+plugins: typeguard-4.5.1, anyio-4.16.0
+collected 28 items / 20 deselected / 8 selected
+
+../branch-falsify-wip/tests/test_turbo_lowmem_adamw.py .F......          [100%]
+
+=================================== FAILURES ===================================
+______________ test_triton_fused_launch_matches_reference[torch] _______________
+
+reference = 'torch'
+record_property = <function record_property.<locals>.append_property at 0x7eb959ba1760>
+
+    @pytest.mark.skipif(not triton_available(), reason="needs CUDA + triton")
+    @pytest.mark.parametrize("reference", ["triton_per_tensor", "torch"])
+    def test_triton_fused_launch_matches_reference(reference, record_property):
+        """Gate 0 for the multi-tensor kernel. Against the per-tensor Triton kernel the result is
+        expected to be bit-identical (same arithmetic, same seeds); the assertions only demand what
+        the torch-parity test demands, so an FMA-contraction difference cannot fail the gate, and
+        the exact-match fraction is printed. A wrong table/seed/offset fails both by a mile."""
+        ref_kw = dict(backend="triton", fused=False) if reference == "triton_per_tensor" else dict(backend="torch")
+        opts, all_params, problems = [], [], []
+        for kw in (ref_kw, dict(backend="triton", fused=True)):
+            groups, params, frozen, late = _fused_problem(device="cuda", scale=6)
+            big = torch.nn.Parameter((torch.randn(1_000_003, generator=torch.Generator().manual_seed(3)) * 0.05).to(torch.bfloat16).cuda())
+            groups[0]["params"].append(big)
+            params = [p for grp in groups for p in grp["params"]]
+            opts.append(LowMemAdamW(groups, lr=1e-3, betas=BETAS, seed=9, **kw))
+            all_params.append(params)
+            problems.append((frozen, late))
+        steps = 12
+        for k in range(steps):
+            if k % 4 == 0:  # resync so a one-ulp difference cannot compound across steps
+                _copy_state(opts[0], all_params[0], opts[1], all_params[1])
+            for opt, params, (frozen, late) in zip(opts, all_params, problems, strict=True):
+                for p, grad in zip(params, _fused_grads(params, frozen, late, k), strict=True):
+                    p.grad = None if grad is None else grad.cuda()
+                opt.step(grad_scale=0.7)
+        assert opts[1].fused_status == "active"
+        assert opts[1].last_step_stats["per_tensor_launches"] == 0 and opts[1].last_step_stats["fused_launches"] <= 5
+    
+        exact = total = 0
+        for pa, pb in zip(all_params[0], all_params[1], strict=True):
+            if pa not in opts[0].state:
+                assert pb not in opts[1].state and torch.equal(_bits(pa.data), _bits(pb.data))
+                continue
+            a, b = opts[0].state[pa], opts[1].state[pb]
+            assert a["step"] == b["step"]
+            n = pa.numel()
+            exact += int((a["qv"] == b["qv"]).sum()) + int((a["qr"] == b["qr"]).sum()) + int((_bits(pa.data) == _bits(pb.data)).sum())
+            total += 3 * n
+            wa, wb = opts[0].true_weight(pa), opts[1].true_weight(pb)
+>           assert float((wa - wb).abs().max()) < 2e-5
+E           AssertionError: assert 2.7179718017578125e-05 < 2e-05
+E            +  where 2.7179718017578125e-05 = float(tensor(2.7180e-05, device='cuda:0'))
+E            +    where tensor(2.7180e-05, device='cuda:0') = <built-in method max of Tensor object at 0x7eb959b563a0>()
+E            +      where <built-in method max of Tensor object at 0x7eb959b563a0> = tensor([0., 0., 0.,  ..., 0., 0., 0.], device='cuda:0').max
+E            +        where tensor([0., 0., 0.,  ..., 0., 0., 0.], device='cuda:0') = <built-in method abs of Tensor object at 0x7eb959b0ec60>()
+E            +          where <built-in method abs of Tensor object at 0x7eb959b0ec60> = (tensor([-0.0083,  0.0112, -0.0392,  ..., -0.1206,  0.0018,  0.0999],\n       device='cuda:0') - tensor([-0.0083,  0.0112, -0.0392,  ..., -0.1206,  0.0018,  0.0999],\n       device='cuda:0')).abs
+
+../branch-falsify-wip/tests/test_turbo_lowmem_adamw.py:513: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  gr00t_lancedb.turbo.lowmem_adamw:lowmem_adamw.py:688 LOWMEM_FUSED_ACTIVE: 29 tensors (1049 programs) per launch, backend=triton
+=========================== short test summary info ============================
+FAILED ../branch-falsify-wip/tests/test_turbo_lowmem_adamw.py::test_triton_fused_launch_matches_reference[torch]
+================= 1 failed, 7 passed, 20 deselected in 13.55s ==================

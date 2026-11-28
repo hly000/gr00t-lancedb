@@ -1,0 +1,406 @@
+{
+  "rules": {
+    "a_pass_min_diff": -0.04,
+    "a_alarm_diff": -0.05,
+    "alpha": 0.05,
+    "mem_max_gb": 20.0
+  },
+  "success_rates": {
+    "b0": {
+      "mean_success_rate": 0.75,
+      "successes": 75,
+      "valid_episodes": 100,
+      "ci95": [
+        0.657,
+        0.8245
+      ]
+    },
+    "b16_fp32": {
+      "mean_success_rate": 0.36,
+      "successes": 36,
+      "valid_episodes": 100,
+      "ci95": [
+        0.2727,
+        0.4576
+      ]
+    },
+    "b16_lowmem": {
+      "mean_success_rate": 0.46,
+      "successes": 46,
+      "valid_episodes": 100,
+      "ci95": [
+        0.3656,
+        0.5574
+      ]
+    },
+    "mn2": {
+      "mean_success_rate": 0.61,
+      "successes": 61,
+      "valid_episodes": 100,
+      "ci95": [
+        0.512,
+        0.6998
+      ]
+    }
+  },
+  "verdict_a_accuracy": {
+    "result": "PASS",
+    "diff": 0.1,
+    "mcnemar_p": 0.18392,
+    "diff_ci95": [
+      -0.0315,
+      0.2315
+    ],
+    "note": null
+  },
+  "verdict_a_memory": {
+    "result": "PASS",
+    "mode": "b16_k1_cap24",
+    "status": "ok",
+    "peak_gpu_mem_gb": 16.92,
+    "peak_torch_alloc_gb": 15.7,
+    "cuda_mem_limit_gib": 23.696,
+    "note": null
+  },
+  "verdict_b_multi_noise": {
+    "result": "KEEP (preliminary: needs a second training seed)",
+    "diff": 0.15,
+    "mcnemar_p": 0.0357,
+    "diff_ci95": [
+      0.0219,
+      0.2781
+    ]
+  },
+  "batch_effect_b16_fp32_vs_b0": {
+    "diff": -0.39,
+    "diff_ci95": [
+      -0.5073,
+      -0.2727
+    ],
+    "mcnemar_p": 0.0,
+    "paired": true,
+    "pairs": 100
+  },
+  "route": "Both hold: reproduce mn2 vs b16_k1 with a second training seed, then the final matrix.",
+  "pairs": {
+    "b16_fp32_vs_b0": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 75,
+        "success_rate": 0.75,
+        "ci95": [
+          0.657,
+          0.8245
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 36,
+        "success_rate": 0.36,
+        "ci95": [
+          0.2727,
+          0.4576
+        ]
+      },
+      "both_success": 30,
+      "candidate_only_success": 6,
+      "baseline_only_success": 45,
+      "both_fail": 19,
+      "diff": -0.39,
+      "diff_ci95": [
+        -0.5073,
+        -0.2727
+      ],
+      "diff_ci95_task_bootstrap": [
+        -0.49,
+        -0.29
+      ],
+      "mcnemar_p": 0.0,
+      "margin": 0.04,
+      "non_inferior_at_margin": false,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": 0.1,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": -0.4,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": -0.4,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": -0.2,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.1,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": -0.6,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": -0.6,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": -0.5,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": -0.7,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": -0.7
+      }
+    },
+    "b16_lowmem_vs_b0": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 75,
+        "success_rate": 0.75,
+        "ci95": [
+          0.657,
+          0.8245
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 46,
+        "success_rate": 0.46,
+        "ci95": [
+          0.3656,
+          0.5574
+        ]
+      },
+      "both_success": 36,
+      "candidate_only_success": 10,
+      "baseline_only_success": 39,
+      "both_fail": 15,
+      "diff": -0.29,
+      "diff_ci95": [
+        -0.4149,
+        -0.1651
+      ],
+      "diff_ci95_task_bootstrap": [
+        -0.4,
+        -0.18
+      ],
+      "mcnemar_p": 4e-05,
+      "margin": 0.04,
+      "non_inferior_at_margin": false,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": -0.3,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": -0.2,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": -0.3,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": -0.4,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.4,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": -0.2,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": -0.6,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": -0.6,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": -0.4,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": -0.3
+      }
+    },
+    "mn2_vs_b0": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 75,
+        "success_rate": 0.75,
+        "ci95": [
+          0.657,
+          0.8245
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 61,
+        "success_rate": 0.61,
+        "ci95": [
+          0.512,
+          0.6998
+        ]
+      },
+      "both_success": 48,
+      "candidate_only_success": 13,
+      "baseline_only_success": 27,
+      "both_fail": 12,
+      "diff": -0.14,
+      "diff_ci95": [
+        -0.2609,
+        -0.0191
+      ],
+      "diff_ci95_task_bootstrap": [
+        -0.24,
+        -0.04
+      ],
+      "mcnemar_p": 0.03848,
+      "margin": 0.04,
+      "non_inferior_at_margin": false,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": 0.1,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": -0.5,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": -0.5,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": 0.2,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.4,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": -0.3,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": 0.0,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": -0.4,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": -0.5,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": 0.1
+      }
+    },
+    "b16_lowmem_vs_b16_fp32": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 36,
+        "success_rate": 0.36,
+        "ci95": [
+          0.2727,
+          0.4576
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 46,
+        "success_rate": 0.46,
+        "ci95": [
+          0.3656,
+          0.5574
+        ]
+      },
+      "both_success": 18,
+      "candidate_only_success": 28,
+      "baseline_only_success": 18,
+      "both_fail": 36,
+      "diff": 0.1,
+      "diff_ci95": [
+        -0.0315,
+        0.2315
+      ],
+      "diff_ci95_task_bootstrap": [
+        -0.02,
+        0.22
+      ],
+      "mcnemar_p": 0.18392,
+      "margin": 0.04,
+      "non_inferior_at_margin": true,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": -0.4,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": 0.2,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": 0.1,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": -0.2,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.3,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": 0.4,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": 0.0,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": -0.1,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": 0.3,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": 0.4
+      }
+    },
+    "mn2_vs_b16_fp32": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 36,
+        "success_rate": 0.36,
+        "ci95": [
+          0.2727,
+          0.4576
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 61,
+        "success_rate": 0.61,
+        "ci95": [
+          0.512,
+          0.6998
+        ]
+      },
+      "both_success": 25,
+      "candidate_only_success": 36,
+      "baseline_only_success": 11,
+      "both_fail": 28,
+      "diff": 0.25,
+      "diff_ci95": [
+        0.1249,
+        0.3751
+      ],
+      "diff_ci95_task_bootstrap": [
+        0.14,
+        0.36
+      ],
+      "mcnemar_p": 0.00035,
+      "margin": 0.04,
+      "non_inferior_at_margin": true,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": 0.0,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": -0.1,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": -0.1,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": 0.4,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.3,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": 0.3,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": 0.6,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": 0.1,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": 0.2,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": 0.8
+      }
+    },
+    "mn2_vs_b16_lowmem": {
+      "paired": true,
+      "pairs": 100,
+      "unmatched_baseline": 0,
+      "unmatched_candidate": 0,
+      "baseline": {
+        "episodes": 100,
+        "successes": 46,
+        "success_rate": 0.46,
+        "ci95": [
+          0.3656,
+          0.5574
+        ]
+      },
+      "candidate": {
+        "episodes": 100,
+        "successes": 61,
+        "success_rate": 0.61,
+        "ci95": [
+          0.512,
+          0.6998
+        ]
+      },
+      "both_success": 31,
+      "candidate_only_success": 30,
+      "baseline_only_success": 15,
+      "both_fail": 24,
+      "diff": 0.15,
+      "diff_ci95": [
+        0.0219,
+        0.2781
+      ],
+      "diff_ci95_task_bootstrap": [
+        0.04,
+        0.26
+      ],
+      "mcnemar_p": 0.0357,
+      "margin": 0.04,
+      "non_inferior_at_margin": true,
+      "per_task_diff": {
+        "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it": 0.4,
+        "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it": -0.3,
+        "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it": -0.2,
+        "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove": 0.6,
+        "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket": 0.0,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket": -0.1,
+        "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket": 0.6,
+        "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate": 0.2,
+        "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate": -0.1,
+        "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy": 0.4
+      }
+    }
+  },
+  "inputs": {
+    "b0": "/data/runs/falsify_07/eval/b0.json",
+    "b16_fp32": "/data/runs/falsify_07/eval/b16_fp32.json",
+    "b16_lowmem": "/data/runs/falsify_07/eval/b16_lowmem.json",
+    "mn2": "/data/runs/falsify_07/eval/mn2.json",
+    "proof_json": "/data/runs/falsify_07/step1/proof_24gb.json"
+  }
+}

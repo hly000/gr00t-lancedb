@@ -1,0 +1,1 @@
+{"mode":"b16_k1_fp32","train_wall_s":1658,"global_batch_size":16,"multi_noise":1,"optimizer":"native","bf16_weights":0,"compile_head":0}

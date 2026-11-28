@@ -1,0 +1,8 @@
+{
+  "steps": 3000,
+  "median_step_ms": 397.74,
+  "train_s_sum": 1221.0,
+  "peak_gpu_mem_gb": 16.92,
+  "peak_torch_alloc_gb": 15.7,
+  "final_loss_last50_mean": 0.14041
+}

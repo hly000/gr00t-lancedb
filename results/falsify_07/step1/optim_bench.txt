@@ -1,0 +1,38 @@
+/data/Isaac-GR00T/.venv/lib/python3.12/site-packages/albumentations/__init__.py:13: UserWarning: A new version of Albumentations is available: 2.0.8 (you have 1.4.18). Upgrade using: pip install -U albumentations. To disable automatic update checks, set the environment variable NO_ALBUMENTATIONS_UPDATE to 1.
+  check_for_updates()
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 3847.10it/s]
+/data/Isaac-GR00T/gr00t/model/modules/dit.py:278: FutureWarning: Accessing config attribute `compute_dtype` directly via 'AlternateVLDiT' object attribute is deprecated. Please access 'compute_dtype' over 'AlternateVLDiT's config object instead, e.g. 'unet.config.compute_dtype'.
+  embedding_dim=self.inner_dim, compute_dtype=self.compute_dtype
+/data/Isaac-GR00T/gr00t/model/modules/dit.py:309: FutureWarning: Accessing config attribute `output_dim` directly via 'AlternateVLDiT' object attribute is deprecated. Please access 'output_dim' over 'AlternateVLDiT's config object instead, e.g. 'unet.config.output_dim'.
+  self.proj_out_2 = nn.Linear(self.inner_dim, self.output_dim)
+Total number of DiT parameters:  1091722240
+Total number of SelfAttentionTransformer parameters:  201433088
+[bench] adamw_bf16: {'tensors': 537, 'params': 1620515968, 'step_ms': 21.32, 'step_wall_ms': 21.37, 'weights_plus_state_gb': 9.067, 'weights_plus_state_bytes_per_param': 6.008, 'with_grad_bytes_per_param': 8.008, 'peak_alloc_gb': 12.115}
+LOWMEM_FUSED_ACTIVE: 537 tensors (1582617 programs) per launch, backend=triton
+[bench] lowmem_bf16: {'tensors': 537, 'params': 1620515968, 'step_ms': 45.18, 'step_wall_ms': 45.25, 'weights_plus_state_gb': 9.175, 'weights_plus_state_bytes_per_param': 6.08, 'with_grad_bytes_per_param': 8.08, 'peak_alloc_gb': 12.223, 'fused': 'active', 'launches_per_step': 1}
+[bench] lowmem_bf16_pt: {'tensors': 537, 'params': 1620515968, 'step_ms': 32.82, 'step_wall_ms': 32.88, 'weights_plus_state_gb': 9.17, 'weights_plus_state_bytes_per_param': 6.076, 'with_grad_bytes_per_param': 8.076, 'peak_alloc_gb': 12.217, 'fused': 'off', 'launches_per_step': 537}
+[bench] lowmem_bf16_1t: {'tensors': 1, 'params': 1620515968, 'step_ms': 16.91, 'step_wall_ms': 16.98, 'weights_plus_state_gb': 9.15, 'weights_plus_state_bytes_per_param': 6.063, 'with_grad_bytes_per_param': 8.063, 'peak_alloc_gb': 15.187, 'fused': 'pending', 'launches_per_step': 1}
+LOWMEM_FUSED_ACTIVE: 537 tensors (1582617 programs) per launch, backend=triton
+[bench] lowmem_fp32: {'tensors': 537, 'params': 1620515968, 'step_ms': 32.7, 'step_wall_ms': 32.77, 'weights_plus_state_gb': 9.177, 'weights_plus_state_bytes_per_param': 6.081, 'with_grad_bytes_per_param': 10.081, 'peak_alloc_gb': 15.271, 'fused': 'active', 'launches_per_step': 1}
+[bench] bnb8bit_bf16: {'tensors': 537, 'params': 1620515968, 'step_ms': 95.48, 'step_wall_ms': 95.54, 'weights_plus_state_gb': 6.111, 'weights_plus_state_bytes_per_param': 4.049, 'with_grad_bytes_per_param': 6.049, 'peak_alloc_gb': 9.158}
+[bench] bnb8bit_fp32: {'tensors': 537, 'params': 1620515968, 'step_ms': 97.26, 'step_wall_ms': 97.32, 'weights_plus_state_gb': 9.127, 'weights_plus_state_bytes_per_param': 6.047, 'with_grad_bytes_per_param': 10.047, 'peak_alloc_gb': 15.221}
+[bench] torchao_8bit_bf16sr: {'tensors': 537, 'params': 1620515968, 'step_ms': 424.26, 'step_wall_ms': 424.35, 'weights_plus_state_gb': 6.11, 'weights_plus_state_bytes_per_param': 4.049, 'with_grad_bytes_per_param': 6.049, 'peak_alloc_gb': 9.158}
+[bench] torchao_8bit_fp32: {'tensors': 537, 'params': 1620515968, 'step_ms': 394.87, 'step_wall_ms': 394.96, 'weights_plus_state_gb': 9.127, 'weights_plus_state_bytes_per_param': 6.048, 'with_grad_bytes_per_param': 10.048, 'peak_alloc_gb': 15.221}
+[bench] adamw_fp32: {'tensors': 537, 'params': 1620515968, 'step_ms': 38.58, 'step_wall_ms': 38.65, 'weights_plus_state_gb': 18.113, 'weights_plus_state_bytes_per_param': 12.001, 'with_grad_bytes_per_param': 16.001, 'peak_alloc_gb': 24.206}
+| optimizer | tensors | step ms (median) | weights+state B/param | peak alloc GB | fused |
+|---|---:|---:|---:|---:|---|
+| `adamw_bf16` | 537 | 21.32 | 6.008 | 12.115 | - |
+| `lowmem_bf16` | 537 | 45.18 | 6.08 | 12.223 | active |
+| `lowmem_bf16_pt` | 537 | 32.82 | 6.076 | 12.217 | off |
+| `lowmem_fp32` | 537 | 32.7 | 6.081 | 15.271 | active |
+| `bnb8bit_bf16` | 537 | 95.48 | 4.049 | 9.158 | - |
+| `bnb8bit_fp32` | 537 | 97.26 | 6.047 | 15.221 | - |
+| `torchao_8bit_bf16sr` | 537 | 424.26 | 4.049 | 9.158 | - |
+| `torchao_8bit_fp32` | 537 | 394.87 | 6.048 | 15.221 | - |
+| `adamw_fp32` | 537 | 38.58 | 12.001 | 24.206 | - |
+
+Single-tensor floor (not comparable with the rows above):
+
+| optimizer | tensors | step ms (median) | weights+state B/param | peak alloc GB | fused |
+|---|---:|---:|---:|---:|---|
+| `lowmem_bf16_1t` | 1 | 16.91 | 6.063 | 15.187 | pending |

@@ -34,6 +34,9 @@ Key v1 performance / ablation env vars:
   NIC bytes in ``step.io``)
 - ``GR00T_PREEMPT_*``: see ``gr00t_lancedb.exact_resume._make_preempt_callback``
   (``GR00T_PREEMPT_CKPT_DTYPE=auto|fp32|bf16|int8``, ``GR00T_PREEMPT_DEADLINE_S`` ...)
+- ``GR00T_CUDA_MEM_FRACTION`` (unset by default: no limit). ``0.6`` caps this process's CUDA
+  caching allocator at 60 % of the card (24 GiB of an A100-40GB's 39.4 GiB), so a larger
+  card reproduces a 24 GB card's out-of-memory point. Logged as a ``cuda_mem_limit`` event.
 
 Startup segments (``startup_summary``): ``imports_s`` -> ``model_load_s`` (config, model and
 processor until the dataset build starts) -> ``dataset_build_s`` -> ``trainer_init_s`` ->
@@ -69,6 +72,9 @@ logger = logging.getLogger("gr00t_lancedb.launch")
 
 # Benchmark-only: skip the end-of-training checkpoint and GR00T's final save_model().
 SKIP_FINAL_SAVE = os.environ.get("GR00T_BENCH_SKIP_FINAL_SAVE", "0") == "1"
+# Keep checkpoint-<max_steps> but skip the final save_model() into the run directory, which
+# writes the same weights a second time (12.5 GB for an fp32 run). Evals read the checkpoint.
+SKIP_FINAL_MODEL_SAVE = os.environ.get("GR00T_SKIP_FINAL_MODEL_SAVE", "0") == "1"
 
 _VALID_MP_CTXS = ("fork", "forkserver", "spawn")
 
@@ -153,6 +159,46 @@ def _memory_mb(full: bool) -> dict[str, float]:
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def _apply_cuda_mem_fraction(raw: str | None) -> dict[str, Any] | None:
+    """Cap the CUDA caching allocator at ``raw`` (a fraction of device 0), or do nothing.
+
+    Must run before the model is moved to the GPU. A request that cannot be honoured raises:
+    a silently uncapped run would report "fits in 24 GB" for something that does not.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    frac = float(raw)
+    if not 0.0 < frac <= 1.0:
+        raise ValueError(f"GR00T_CUDA_MEM_FRACTION must be in (0, 1], got {raw!r}")
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("GR00T_CUDA_MEM_FRACTION is set but CUDA is not available")
+    torch.cuda.set_per_process_memory_fraction(frac, 0)
+    total = torch.cuda.get_device_properties(0).total_memory
+    return {
+        "fraction": frac,
+        "limit_gib": round(frac * total / 2**30, 3),
+        "device_total_gib": round(total / 2**30, 3),
+    }
+
+
+def _torch_cuda_peaks() -> dict[str, float]:
+    """Process-local allocator peaks in MiB (``nvidia-smi``'s ``gpu_mem_mb`` is device-wide)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_initialized():
+            return {}
+        return {
+            "torch_max_alloc_mb": torch.cuda.max_memory_allocated() / 2**20,
+            "torch_max_reserved_mb": torch.cuda.max_memory_reserved() / 2**20,
+        }
+    except Exception:  # noqa: BLE001 - metrics must never kill training
+        return {}
 
 
 def _net_rx_bytes() -> int | None:
@@ -386,6 +432,7 @@ def make_bench_callback(
                 **mem,
                 "gpu_util": util,
                 "gpu_mem_mb": gmem,
+                **_torch_cuda_peaks(),
             }
             if "loss" in loss_box:
                 # Raw per-step training loss (GR00T only logs a smoothed value every N steps).
@@ -849,6 +896,11 @@ def main() -> None:
     metrics_path = Path(os.environ.get("GR00T_BENCH_METRICS", str(run_output_dir / "bench_metrics.jsonl")))
     phase_box: dict[str, Any] = _RUN["phases"]
     _RUN["output_dir"] = run_output_dir
+    mem_limit = _apply_cuda_mem_fraction(os.environ.get("GR00T_CUDA_MEM_FRACTION"))
+    if mem_limit is not None:
+        phase_box["cuda_mem_limit"] = mem_limit
+        logger.info("GR00T_CUDA_MEM_FRACTION: CUDA allocator capped at %s", mem_limit)
+        _append_metric_line(metrics_path, {"event": "cuda_mem_limit", "t": time.time(), **mem_limit})
     if backend == "lance" and os.environ.get("GR00T_LANCE_IO_STATS", "1") == "1":
         # Workers inherit the env and flush per-process Lance blob / cache counters here.
         os.environ.setdefault(
@@ -1080,8 +1132,8 @@ def main() -> None:
             return out
 
         def save_model(self, output_dir=None, _internal_call=False):
-            if SKIP_FINAL_SAVE and not _internal_call:
-                logger.info("GR00T_BENCH_SKIP_FINAL_SAVE=1: skipping final save_model()")
+            if (SKIP_FINAL_SAVE or SKIP_FINAL_MODEL_SAVE) and not _internal_call:
+                logger.info("GR00T_BENCH_SKIP_FINAL_SAVE / GR00T_SKIP_FINAL_MODEL_SAVE: skipping final save_model()")
                 return
             return super().save_model(output_dir, _internal_call=_internal_call)
 

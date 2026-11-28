@@ -1,0 +1,920 @@
+{
+  "schema": 2,
+  "model_path": "/data/runs/online_turbo_3000s/b16_k1/checkpoint-3000",
+  "n_episodes_per_task": 10,
+  "seed_base": 20260,
+  "seeded": true,
+  "episode_runner": "one rollout process per episode (n_envs=1)",
+  "eval_wall_s": 2286.03,
+  "total_episodes": 100,
+  "valid_episodes": 100,
+  "successes": 46,
+  "mean_success_rate": 0.46,
+  "ci95": [
+    0.3656,
+    0.5574
+  ],
+  "complete": true,
+  "tasks": [
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 5,
+      "success_rate": 0.5,
+      "wall_s": 198.23,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 129.3,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 20260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 130.11,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 20261,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 81.54,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 20262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 129.06,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 20263,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 70.44,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 20264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 99.18,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 20265,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 99.68,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 20266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 67.53,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 20267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 61.95,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 20268,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 68.12,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 20269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 4,
+      "success_rate": 0.4,
+      "wall_s": 231.83,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 134.05,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 21260,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 74.64,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 21261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 134.44,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 21262,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 77.09,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 21263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 135.12,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 21264,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 84.92,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 21265,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 109.78,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 21266,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 97.16,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 21267,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 97.39,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 21268,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 61.38,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 21269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 4,
+      "success_rate": 0.4,
+      "wall_s": 232.62,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 139.85,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 22260,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.55,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 22261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 138.53,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 22262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 138.72,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 22263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 139.53,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 22264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 102.09,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 22265,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 65.66,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 22266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 65.05,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 22267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 71.25,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 22268,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 92.77,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 22269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 8,
+      "success_rate": 0.8,
+      "wall_s": 184.31,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 114.82,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 23260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 115.42,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 23261,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 62.5,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 23262,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 62.8,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 23263,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 61.57,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 23264,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.22,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 23265,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 67.43,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 23266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 76.3,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 23267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.49,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 23268,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 47.53,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 23269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 3,
+      "success_rate": 0.3,
+      "wall_s": 246.25,
+      "episodes": [
+        {
+          "success": true,
+          "wall_s": 91.3,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 24260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 143.48,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 24261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 142.59,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 24262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 142.98,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 24263,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 72.19,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 24264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 113.28,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 24265,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 109.54,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 24266,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 103.3,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 24267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.86,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 24268,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 102.76,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 24269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 6,
+      "success_rate": 0.6,
+      "wall_s": 208.25,
+      "episodes": [
+        {
+          "success": true,
+          "wall_s": 63.38,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 25260,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 72.76,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 25261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 132.93,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 25262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 132.52,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 25263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 133.84,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 25264,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.86,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 25265,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 62.87,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 25266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 46.52,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 25267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 46.62,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 25268,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 75.0,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 25269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 4,
+      "success_rate": 0.4,
+      "wall_s": 224.09,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 134.52,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 26260,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 69.8,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 26261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 135.94,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 26262,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 64.04,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 26263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 135.41,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 26264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 104.54,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 26265,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 104.78,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 26266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 60.81,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 26267,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 88.68,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 26268,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 66.28,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 26269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 8,
+      "success_rate": 0.8,
+      "wall_s": 177.49,
+      "episodes": [
+        {
+          "success": true,
+          "wall_s": 80.04,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 27260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 110.62,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 27261,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 79.13,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 27262,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 77.63,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 27263,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 73.29,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 27264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 104.19,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 27265,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 81.67,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 27266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 79.32,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 27267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 58.69,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 27268,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 59.91,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 27269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE8_put_both_moka_pots_on_the_stove",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 0,
+      "success_rate": 0.0,
+      "wall_s": 283.33,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 141.31,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 28260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 140.65,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 28261,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 140.33,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 28262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 140.1,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 28263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 140.91,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 28264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 143.0,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 28265,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 142.13,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 28266,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 142.26,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 28267,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 141.86,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 28268,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 142.02,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 28269,
+          "attempts": 1
+        }
+      ]
+    },
+    {
+      "task": "libero_sim/KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
+      "n_episodes": 10,
+      "valid_episodes": 10,
+      "successes": 4,
+      "success_rate": 0.4,
+      "wall_s": 234.12,
+      "episodes": [
+        {
+          "success": false,
+          "wall_s": 139.02,
+          "returncode": 0,
+          "episode": 0,
+          "seed": 29260,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 138.37,
+          "returncode": 0,
+          "episode": 1,
+          "seed": 29261,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 71.38,
+          "returncode": 0,
+          "episode": 2,
+          "seed": 29262,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 137.43,
+          "returncode": 0,
+          "episode": 3,
+          "seed": 29263,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 139.26,
+          "returncode": 0,
+          "episode": 4,
+          "seed": 29264,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 100.3,
+          "returncode": 0,
+          "episode": 5,
+          "seed": 29265,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 61.93,
+          "returncode": 0,
+          "episode": 6,
+          "seed": 29266,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 76.87,
+          "returncode": 0,
+          "episode": 7,
+          "seed": 29267,
+          "attempts": 1
+        },
+        {
+          "success": true,
+          "wall_s": 65.48,
+          "returncode": 0,
+          "episode": 8,
+          "seed": 29268,
+          "attempts": 1
+        },
+        {
+          "success": false,
+          "wall_s": 94.86,
+          "returncode": 0,
+          "episode": 9,
+          "seed": 29269,
+          "attempts": 1
+        }
+      ]
+    }
+  ]
+}

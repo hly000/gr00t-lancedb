@@ -12,11 +12,33 @@
 #   mn4           8 frames x 4 noise = 32 FM samples + LowMemAdamW bf16  [fastest VLM cut]
 #   lowmem_only  32 frames x 1 noise = 32 FM samples + LowMemAdamW bf16  [isolates 24 GB opt]
 #   mn2_fp32     16 frames x 2 noise = 32 FM samples + stock fp32 AdamW  [isolates multi-noise]
+# Falsification matrix (docs/plans/07, single-variable steps from B0 to mn2):
+#   b16_k1_fp32  16 frames x 1 noise, stock fp32 AdamW, nothing from the turbo path
+#                [= stock at batch 16: B0 -> this isolates the batch size]
+#   b16_k1       16 frames x 1 noise + LowMemAdamW bf16 (mn2 without multi-noise)
+#                [b16_k1_fp32 -> this isolates the optimizer; this -> mn2 isolates K=2]
+# Baselines for the comparison table (meant for BENCH_STEPS runs):
+#   stock        32 frames, stock fp32 AdamW, nothing from this repo's turbo path          [B0]
+#   stock_ga2    16 frames x grad-accum 2, stock fp32 AdamW, frozen VLM cast to bf16
+#                ["just lower the batch size and cast the backbone": B1]
+#   bnb8bit      16 frames x 2 noise + bitsandbytes AdamW8bit on fp32 weights          [B2]
 #
 # Usage:
 #   bash scripts/run_online_turbo.sh
-#   MODE=mn4 EVAL=1 N_EPISODES=10 bash scripts/run_online_turbo.sh
-#   MODE=mn2_fp32 COMPILE_HEAD=0 bash scripts/run_online_turbo.sh
+#   MODE=mn4 COMPILE_HEAD=1 bash scripts/run_online_turbo.sh
+#   MODE=mn2 BASELINE_EVAL=/data/runs/b0/eval.json bash scripts/run_online_turbo.sh
+#   MODE=stock_ga2 BENCH_STEPS=50 bash scripts/run_online_turbo.sh   # speed/memory only
+#
+# BENCH_STEPS=N  run N steps, save nothing, skip the eval, and write bench_summary.json with
+#                the steady step time and peak GPU memory. A CUDA out-of-memory error is
+#                recorded as the result ("status": "oom") and the script exits 0.
+#                BENCH_TAG=_cap24 appends to the run name (bench_<MODE><TAG>), so a run under
+#                GR00T_CUDA_MEM_FRACTION=0.6 (24 GiB of an A100-40GB) and an uncapped run of
+#                the same mode do not overwrite each other.
+# Eval: N_EPISODES per task (default 20 = 200 episodes), one seeded simulator process per
+#       episode, N_ENVS of them in parallel. Use the same EVAL_SEED_BASE for every
+#       checkpoint you want to compare; BASELINE_EVAL=<eval.json> prints the paired
+#       comparison (difference, 95% CI, exact McNemar) at the end.
 set -euo pipefail
 
 [ -f "${GR00T_ENV_FILE:-/data/env.sh}" ] && source "${GR00T_ENV_FILE:-/data/env.sh}"
@@ -31,13 +53,20 @@ MODE="${MODE:-mn2}"
 MAX_STEPS="${MAX_STEPS:-3000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 OUT_ROOT="${OUT_ROOT:-/data/runs/online_turbo_${MAX_STEPS}s}"
-SMOKE="${SMOKE:-1}"
 EVAL="${EVAL:-1}"
-N_EPISODES="${N_EPISODES:-5}"
+N_EPISODES="${N_EPISODES:-20}"
 N_ENVS="${N_ENVS:-5}"
+EVAL_SEED_BASE="${EVAL_SEED_BASE:-20260}"
+BASELINE_EVAL="${BASELINE_EVAL:-}"
 PORT="${PORT:-5560}"
 COMPILE_HEAD="${COMPILE_HEAD:-0}"
+LOWMEM_FUSED="${LOWMEM_FUSED:-auto}"
 SEED="${SEED:-42}"
+BENCH_STEPS="${BENCH_STEPS:-0}"
+# A bench run is itself short and may be expected to run out of memory: no smoke gate.
+if [ "$BENCH_STEPS" != "0" ]; then SMOKE="${SMOKE:-0}"; else SMOKE="${SMOKE:-1}"; fi
+ALLOW_PURE_BF16=0
+EXTRA_ARGS=()
 
 case "$MODE" in
   mn2)
@@ -68,8 +97,49 @@ case "$MODE" in
     BF16_WEIGHTS="${BF16_WEIGHTS:-0}"
     BF16_BACKBONE="${BF16_BACKBONE:-0}"
     ;;
+  b16_k1)
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+    MULTI_NOISE="${MULTI_NOISE:-1}"
+    OPTIMIZER="${OPTIMIZER:-lowmem}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-1}"
+    BF16_BACKBONE="${BF16_BACKBONE:-1}"
+    ;;
+  b16_k1_fp32)
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+    MULTI_NOISE="${MULTI_NOISE:-1}"
+    OPTIMIZER="${OPTIMIZER:-native}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-0}"
+    BF16_BACKBONE="${BF16_BACKBONE:-0}"
+    COMPILE_HEAD=0
+    ;;
+  stock)
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+    MULTI_NOISE="${MULTI_NOISE:-1}"
+    OPTIMIZER="${OPTIMIZER:-native}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-0}"
+    BF16_BACKBONE="${BF16_BACKBONE:-0}"
+    COMPILE_HEAD=0
+    ;;
+  stock_ga2)
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+    MULTI_NOISE="${MULTI_NOISE:-1}"
+    OPTIMIZER="${OPTIMIZER:-native}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-0}"
+    BF16_BACKBONE="${BF16_BACKBONE:-1}"
+    EXTRA_ARGS=(--gradient_accumulation_steps "${GRAD_ACCUM:-2}")
+    ;;
+  bnb8bit)
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+    MULTI_NOISE="${MULTI_NOISE:-2}"
+    OPTIMIZER="${OPTIMIZER:-bnb8bit}"
+    # fp32 weights: what a user gets from optim=adamw_8bit. BF16_WEIGHTS=1 measures the
+    # smaller (and non-converging: no carry for sub-ulp updates) pure-bf16 variant.
+    BF16_WEIGHTS="${BF16_WEIGHTS:-0}"
+    BF16_BACKBONE="${BF16_BACKBONE:-1}"
+    [ "$BF16_WEIGHTS" = "1" ] && ALLOW_PURE_BF16=1
+    ;;
   *)
-    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32)" >&2
+    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32 | b16_k1 | b16_k1_fp32 | stock | stock_ga2 | bnb8bit)" >&2
     exit 2
     ;;
 esac
@@ -95,7 +165,14 @@ export GR00T_TURBO_OPTIMIZER="$OPTIMIZER"
 export GR00T_TURBO_BF16_WEIGHTS="$BF16_WEIGHTS"
 export GR00T_TURBO_BF16_BACKBONE="$BF16_BACKBONE"
 export GR00T_TURBO_COMPILE_HEAD="$COMPILE_HEAD"
+export GR00T_TURBO_LOWMEM_FUSED="$LOWMEM_FUSED"
+export GR00T_TURBO_ALLOW_PURE_BF16="$ALLOW_PURE_BF16"
 export GR00T_TURBO_SEED="$SEED"
+
+CHECK_FLAGS=()
+case "$MODE" in stock|b16_k1_fp32) CHECK_FLAGS+=(--no-turbo) ;; esac
+[ "$COMPILE_HEAD" = "1" ] && CHECK_FLAGS+=(--expect-compile)
+[ "$OPTIMIZER" = "lowmem" ] && [ "$LOWMEM_FUSED" != "off" ] && CHECK_FLAGS+=(--expect-fused)
 
 # ---------------------------------------------------------------------------
 # Gate 1: 5-step smoke test + checkpoint key & finite-loss verification
@@ -107,50 +184,35 @@ if [ "$SMOKE" = "1" ]; then
   BACKEND="$BACKEND" DATASET="$DATASET" OUT="$SMOKE_OUT" BASE_MODEL="$BASE_MODEL" \
     MAX_STEPS=5 SAVE_STEPS=5 SAVE_TOTAL_LIMIT=1 \
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
-    bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh"
+    bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$SMOKE_OUT.log"
 
+  # Also fails when COMPILE_HEAD=1 did not actually compile, or when LowMemAdamW is not
+  # running its single fused launch: both would silently produce slower numbers.
   (
     cd "$GR00T_ROOT"
-    uv run --no-sync python - "$SMOKE_OUT" <<'PY'
-import json, math, sys
-from pathlib import Path
-from safetensors import safe_open
-
-smoke_dir = Path(sys.argv[1])
-metrics_path = smoke_dir / "bench_metrics.jsonl"
-if not metrics_path.is_file():
-    raise SystemExit(f"FAIL: missing {metrics_path}")
-rows = [json.loads(l) for l in metrics_path.read_text().splitlines() if l.strip()]
-step_rows = [r for r in rows if r.get("event") == "step"]
-if len(step_rows) < 5:
-    raise SystemExit(f"FAIL: expected 5 step rows, got {len(step_rows)}")
-for r in step_rows:
-    loss = r.get("step_loss")
-    if loss is None or not math.isfinite(float(loss)):
-        raise SystemExit(f"FAIL: non-finite loss at step {r.get('global_step')}: {loss}")
-turbo_records = [r["online_turbo"] for r in rows if isinstance(r.get("online_turbo"), dict)]
-if not turbo_records or not turbo_records[-1].get("enabled"):
-    raise SystemExit(f"FAIL: online_turbo was not active in smoke run: {turbo_records}")
-ckpt = smoke_dir / "checkpoint-5"
-if not ckpt.is_dir():
-    ckpt = smoke_dir
-st_files = sorted(ckpt.glob("*.safetensors"))
-if not st_files:
-    raise SystemExit(f"FAIL: no safetensors found in {ckpt}")
-bad_keys = []
-for sf in st_files:
-    with safe_open(str(sf), framework="pt", device="cpu") as fh:
-        bad_keys.extend(k for k in fh.keys() if "_orig_mod" in k)
-if bad_keys:
-    raise SystemExit(f"FAIL: compiled _orig_mod keys leaked into checkpoint: {bad_keys[:5]}")
-losses = [round(float(r["step_loss"]), 4) for r in step_rows]
-mems = [r.get("gpu_mem_mb") for r in step_rows if r.get("gpu_mem_mb") is not None]
-peak_mb = max(mems) if mems else None
-fits_24g = (f"{peak_mb:.0f} MB ({'<=24GB OK' if peak_mb <= 24576 else '>24GB'})") if peak_mb is not None else "n/a"
-print(f"[Gate 1 PASS] losses={losses} peak_gpu={fits_24g} safetensors={len(st_files)} (0 _orig_mod keys) turbo={turbo_records[-1]}")
-PY
+    uv run --no-sync python "$REPO_ROOT/scripts/turbo_run_checks.py" smoke "$SMOKE_OUT" "$SMOKE_OUT.log" \
+      ${CHECK_FLAGS[@]+"${CHECK_FLAGS[@]}"}
   )
-  rm -rf "$SMOKE_OUT"
+  rm -rf "$SMOKE_OUT" "$SMOKE_OUT.log"
+fi
+
+# ---------------------------------------------------------------------------
+# Bench mode: N steps for step time + peak memory, nothing saved, no eval
+# ---------------------------------------------------------------------------
+if [ "$BENCH_STEPS" != "0" ]; then
+  RUN_OUT="$OUT_ROOT/bench_${MODE}${BENCH_TAG:-}"
+  rm -rf "$RUN_OUT"
+  echo "================ [Bench] $MODE${BENCH_TAG:-}: $BENCH_STEPS steps (B=$GLOBAL_BATCH_SIZE x K=$MULTI_NOISE, opt=$OPTIMIZER, compile=$COMPILE_HEAD, mem_fraction=${GR00T_CUDA_MEM_FRACTION:-none}) ================"
+  set +e
+  BACKEND="$BACKEND" DATASET="$DATASET" OUT="$RUN_OUT" BASE_MODEL="$BASE_MODEL" \
+    MAX_STEPS="$BENCH_STEPS" SAVE_STEPS=1000000 SAVE_TOTAL_LIMIT=1 GR00T_BENCH_SKIP_FINAL_SAVE=1 \
+    GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
+    bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$RUN_OUT.train.log"
+  set -e
+  mkdir -p "$RUN_OUT"
+  python3 "$REPO_ROOT/scripts/turbo_run_checks.py" bench "$RUN_OUT" "$RUN_OUT.train.log" \
+    --mode "$MODE${BENCH_TAG:-}" --steps "$BENCH_STEPS" --out-json "$RUN_OUT/bench_summary.json"
+  exit $?
 fi
 
 # ---------------------------------------------------------------------------
@@ -166,7 +228,7 @@ else
   BACKEND="$BACKEND" DATASET="$DATASET" OUT="$RUN_OUT" BASE_MODEL="$BASE_MODEL" \
     MAX_STEPS="$MAX_STEPS" SAVE_STEPS="$MAX_STEPS" SAVE_TOTAL_LIMIT=1 \
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
-    bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" 2>&1 | tee "$RUN_OUT.train.log"
+    bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$RUN_OUT.train.log"
   T1=$(date +%s)
   echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"compile_head\":$COMPILE_HEAD}" \
     > "$RUN_OUT/online_turbo_run.json"
@@ -184,6 +246,7 @@ if [ "$EVAL" = "1" ]; then
     --model-path "$CKPT" \
     --n-episodes "$N_EPISODES" \
     --n-envs "$N_ENVS" \
+    --seed-base "$EVAL_SEED_BASE" \
     --port "$PORT" \
     --out-json "$RUN_OUT/eval.json"
 
@@ -196,6 +259,13 @@ meta = json.loads((run_dir / "online_turbo_run.json").read_text()) if (run_dir /
 sr = ev.get("mean_success_rate")
 sr_s = f"{100.0 * sr:.2f}%" if sr is not None else "FAILED (null)"
 wall_m = f"{meta['train_wall_s'] / 60.0:.1f} min" if "train_wall_s" in meta else "n/a"
-print(f"\n[SUMMARY] mode={meta.get('mode', run_dir.name)} | train={wall_m} | LIBERO-10={sr_s} (vs Native Group 1: 38.3 min, 37.0 GB, 81.67%)")
+ci = ev.get("ci95")
+n_s = f" ({ev.get('successes')}/{ev.get('valid_episodes')}, 95% CI {ci})" if ci else ""
+print(f"\n[SUMMARY] mode={meta.get('mode', run_dir.name)} | train={wall_m} | LIBERO-10={sr_s}{n_s}")
 PY
+
+  if [ -n "$BASELINE_EVAL" ]; then
+    python3 "$REPO_ROOT/scripts/compare_libero_evals.py" --baseline "$BASELINE_EVAL" \
+      "$MODE=$RUN_OUT/eval.json" --out-json "$RUN_OUT/eval_vs_baseline.json"
+  fi
 fi
