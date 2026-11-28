@@ -78,6 +78,8 @@ class OnlineTurboConfig:
     # Clip through LowMemAdamW.clip_scale() (gradient scale applied inside the update) instead
     # of HF's in-place clip of bf16 gradients. Off by default for the same reason.
     fused_clip: bool = False
+    # Activation checkpointing of the DiT transformer blocks (docs/plans/08 WP2 2.3): recompute
+    # each block in backward instead of keeping its activations. Off by default.
     grad_ckpt_head: bool = False
     ema_decay: float = 0.0
     ema_update_every: int = 10
@@ -305,6 +307,32 @@ def build_third_party_optimizer(
     raise ValueError(f"Unsupported third-party optimizer kind={kind!r}")
 
 
+def checkpoint_dit_blocks(action_head: nn.Module) -> int:
+    """Wrap every ``action_head.model.transformer_blocks[i]`` in non-reentrant activation
+    checkpointing. Active only while the block is training and autograd is on, so evaluation
+    and ``no_grad`` passes are unchanged. Idempotent; returns the number of blocks wrapped."""
+    from torch.utils.checkpoint import checkpoint
+
+    blocks = getattr(getattr(action_head, "model", None), "transformer_blocks", None)
+    if blocks is None:
+        return 0
+    wrapped = 0
+    for block in blocks:
+        if getattr(block, "_turbo_grad_ckpt", False):
+            continue
+        original = block.forward
+
+        def _forward(*args: Any, _orig: Any = original, _mod: nn.Module = block, **kwargs: Any) -> Any:
+            if _mod.training and torch.is_grad_enabled():
+                return checkpoint(_orig, *args, use_reentrant=False, **kwargs)
+            return _orig(*args, **kwargs)
+
+        block.forward = _forward  # type: ignore[method-assign]
+        block._turbo_grad_ckpt = True
+        wrapped += 1
+    return wrapped
+
+
 def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, Any]:
     """Apply online acceleration patches in place on a GR00T N1.7 model.
 
@@ -361,20 +389,18 @@ def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, An
             info["multi_noise_applied"] = True
 
         if cfg.grad_ckpt_head:
-            dit = getattr(action_head, "model", None)
-            if dit is not None:
-                if hasattr(dit, "gradient_checkpointing_enable"):
-                    try:
-                        dit.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-                    except TypeError:
-                        dit.gradient_checkpointing_enable()
-                else:
-                    dit.gradient_checkpointing = True
-                info["grad_ckpt_head_applied"] = True
-                if cfg.compile_head:
-                    logger.warning(
-                        "[online-turbo] grad_ckpt_head=True with compile_head=True may conflict or slow down compilation"
-                    )
+            # GR00T's DiT has a gradient_checkpointing flag that its forward never reads, so the
+            # flag alone (or diffusers' enable_gradient_checkpointing) would change nothing: wrap
+            # the transformer blocks themselves.
+            n_blocks = checkpoint_dit_blocks(action_head)
+            info["grad_ckpt_dit_blocks"] = n_blocks
+            info["grad_ckpt_head_applied"] = n_blocks > 0
+            if n_blocks == 0:
+                logger.warning("[online-turbo] grad_ckpt_head=True but action_head.model has no transformer_blocks")
+            if cfg.compile_head:
+                logger.warning(
+                    "[online-turbo] grad_ckpt_head=True with compile_head=True may conflict or slow down compilation"
+                )
 
         if cfg.compile_head:
             dit = getattr(action_head, "model", None)

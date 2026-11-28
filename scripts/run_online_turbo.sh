@@ -37,6 +37,7 @@
 #   KEEP_NORM_FP32=0|1  norm parameters stay fp32 under BF16_WEIGHTS (default 1 for FlashAdamW
 #                       modes, 0 otherwise)
 #   FUSED_CLIP=0|1      clip through LowMemAdamW.clip_scale() (default 0)
+#   GRAD_CKPT_HEAD=0|1  activation checkpointing of the DiT blocks (default 0; for 32 x 2 on 24 GB)
 #   FLASHOPTIM_BITS     for OPTIMIZER=flashoptim (flash24 / flash32 pin it)
 #   TRAIN_SEED          GR00T's data / init / noise seed (config.data.seed); unset = GR00T's 42,
 #                       as in every earlier run. SEED only seeds LowMemAdamW's stochastic rounding.

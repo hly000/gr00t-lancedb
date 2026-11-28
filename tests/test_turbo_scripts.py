@@ -883,6 +883,12 @@ def test_plan08_gate_g2():
     assert g["phase_2a"]["result"] == "LOCK flash24_b32" and g["phase_2b"]["result"] == "LOCK mn2_b32_flash"
     g = gates08.gate_g2(proof(("flash24_b32_cap22", "ok", 21.2), ("mn2_b32_flash_cap22", "oom", 22.0)))
     assert g["phase_2a"]["result"] == "FAIL" and g["phase_2b"]["result"].startswith("OOM: needs DiT activation")
+    g = gates08.gate_g2(proof(("flash24_b32_cap22", "ok", 18.4), ("mn2_b32_flash_cap22", "oom", 18.9),
+                              ("mn2_b32_flash_cap22_ckpt", "ok", 20.1)))
+    assert g["phase_2b"]["result"] == "LOCK mn2_b32_flash GRAD_CKPT_HEAD=1"
+    assert g["phase_2b"]["grad_ckpt_probe"]["status"] == "ok"
+    g = gates08.gate_g2(proof(("mn2_b32_flash_cap22", "oom", 18.9), ("mn2_b32_flash_cap22_ckpt", "oom", 21.9)))
+    assert g["phase_2b"]["result"].startswith("FAIL (OOM, also with GRAD_CKPT_HEAD=1)")
     g = gates08.gate_g2(proof(("flash24_b32_cap22", "oom", 22.0)))
     assert g["phase_2a"]["result"] == "FAIL" and g["phase_2b"]["result"] == "NOT RUN"
     # an uncapped run of the same mode is not evidence for the gate
@@ -915,10 +921,14 @@ def test_plan08_gate_2a():
 
 _STUB_TURBO = r"""#!/usr/bin/env bash
 set -euo pipefail
-echo "$MODE ${BENCH_TAG:-} compile=${COMPILE_HEAD:-0} frac=${GR00T_CUDA_MEM_FRACTION:-none} pp=${PYTHONPATH:-}" >> "$STUB_LOG"
+echo "$MODE ${BENCH_TAG:-} compile=${COMPILE_HEAD:-0} ckpt=${GRAD_CKPT_HEAD:-0}" \
+  "frac=${GR00T_CUDA_MEM_FRACTION:-none} pp=${PYTHONPATH:-}" >> "$STUB_LOG"
 d="$OUT_ROOT/bench_${MODE}${BENCH_TAG:-}"; mkdir -p "$d"
 status=ok; peak=19.6
-case "$MODE" in mn2_b32_flash) status=oom; peak=22.0 ;; flash24_b32) [ "${STUB_B32_OOM:-0}" = 1 ] && { status=oom; peak=22.1; } ;; esac
+case "$MODE" in
+  mn2_b32_flash) if [ "${GRAD_CKPT_HEAD:-0}" = 1 ]; then peak=20.4; else status=oom; peak=22.0; fi ;;
+  flash24_b32) [ "${STUB_B32_OOM:-0}" = 1 ] && { status=oom; peak=22.1; } ;;
+esac
 printf '{"mode": "%s", "status": "%s", "steps_done": 50, "peak_gpu_mem_gb": %s, "cuda_mem_limit_gib": 22.1, ' \
   "${MODE}${BENCH_TAG:-}" "$status" "$peak" > "$d/bench_summary.json"
 echo '"median_step_ms": 540.0}' >> "$d/bench_summary.json"
@@ -948,11 +958,13 @@ def test_run_plan08_probe_flow(tmp_path):
     assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
     calls = log.read_text().splitlines()
     assert [c.split()[0] + c.split()[1] for c in calls] == [
-        "flash24_b32_cap22", "mn2_b32_flash_cap22", "flash24_b32_cap22_compile", "lowmem_only_cap22"]
+        "flash24_b32_cap22", "mn2_b32_flash_cap22", "flash24_b32_cap22_compile", "lowmem_only_cap22",
+        "mn2_b32_flash_cap22_ckpt"]  # 32 x 2 OOMed -> retried with DiT activation checkpointing
+    assert "ckpt=1" in calls[4] and "ckpt=0" in calls[1]
     assert all("frac=0.56" in c for c in calls) and "compile=1" in calls[2] and "compile=0" in calls[0]
     assert calls[0].endswith("pp=/opt/flashoptim") and calls[3].endswith("pp=")  # flashoptim only for FlashAdamW modes
     g2 = json.loads((tmp_path / "plan" / "probe" / "gate_g2.json").read_text())
-    assert g2["phase_2a"]["result"] == "LOCK flash24_b32" and g2["phase_2b"]["result"].startswith("OOM")
+    assert g2["phase_2a"]["result"] == "LOCK flash24_b32" and g2["phase_2b"]["result"] == "LOCK mn2_b32_flash GRAD_CKPT_HEAD=1"
     assert "| `mn2_b32_flash_cap22` | CUDA OOM" in (tmp_path / "plan" / "probe" / "proof_fullbatch.md").read_text()
 
     # 32 x 1 does not fit -> the plan's 16 x 2 x GA2 fallback is probed too
@@ -960,4 +972,15 @@ def test_run_plan08_probe_flow(tmp_path):
     res = subprocess.run(["bash", str(repo / "scripts" / "run_plan08.sh")], env={**env, "STUB_B32_OOM": "1"},
                          capture_output=True, text=True, timeout=120)
     assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
-    assert log.read_text().splitlines()[-1].startswith("mn2_ga2 _cap22")
+    assert [ln.split()[0] for ln in log.read_text().splitlines()][-2:] == ["mn2_ga2", "mn2_b32_flash"]
+
+    # probe2b: only the checkpointed 32 x 2 probe, then the table / gate over everything present
+    log.unlink()
+    res = subprocess.run(["bash", str(repo / "scripts" / "run_plan08.sh")], env={**env, "STEP": "probe2b"},
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+    only = log.read_text().splitlines()
+    assert len(only) == 1 and only[0].startswith("mn2_b32_flash _cap22_ckpt ") and "ckpt=1" in only[0]
+    table = (tmp_path / "plan" / "probe" / "proof_fullbatch.md").read_text()
+    # earlier probe runs in the directory stay in the table (here flash24_b32 from the OOM scenario)
+    assert "| `flash24_b32_cap22` | CUDA OOM" in table and "| `mn2_b32_flash_cap22_ckpt` | runs" in table

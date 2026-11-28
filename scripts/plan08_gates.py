@@ -8,8 +8,8 @@
 
 Gate G2 (Phase 1, 50-step probes under the 22.1 GiB allocator cap = GR00T_CUDA_MEM_FRACTION=0.56):
     Phase 2A  flash24_b32 (32x1) runs, peak <= 21.0 GB
-    Phase 2B  mn2_b32_flash (32x2) runs, peak <= 21.8 GB; if it OOMs: DiT activation
-              checkpointing (WP2 2.3, GRAD_CKPT_HEAD) is needed first.
+    Phase 2B  mn2_b32_flash (32x2) runs, peak <= 21.8 GB; if it OOMs, the same probe with DiT
+              activation checkpointing (GRAD_CKPT_HEAD=1, run name ..._cap22_ckpt) decides.
 
 Gate 2A (Phase 2, a 3000-step run trained under the same cap, 100 paired episodes vs B0):
     memory    trained under the cap, all steps done, peak <= 21.5 GB
@@ -41,9 +41,9 @@ ALPHA = 0.05
 CAP_TAG = "_cap22"
 
 
-def _run(proof: dict[str, Any], mode: str) -> dict[str, Any] | None:
+def _run(proof: dict[str, Any], mode: str, suffix: str = "") -> dict[str, Any] | None:
     runs = {r["mode"]: r for r in proof.get("runs", [])}
-    return runs.get(mode + CAP_TAG)
+    return runs.get(mode + CAP_TAG + suffix)
 
 
 def gate_g2(proof: dict[str, Any]) -> dict[str, Any]:
@@ -65,14 +65,21 @@ def gate_g2(proof: dict[str, Any]) -> dict[str, Any]:
         out["phase_2b"] = {"result": "NOT RUN"}
     else:
         status, peak = k2.get("status"), k2.get("peak_gpu_mem_gb")
+        ckpt = _run(proof, "mn2_b32_flash", suffix="_ckpt")
         if status == "ok" and peak is not None and peak <= G2_B32_K2_MAX_GB:
             result = "LOCK mn2_b32_flash"
-        elif status == "oom":
+        elif status == "oom" and ckpt is None:
             result = "OOM: needs DiT activation checkpointing (WP2 2.3) before Phase 2B"
+        elif status == "oom":
+            c_ok = ckpt.get("status") == "ok" and ckpt.get("peak_gpu_mem_gb") is not None
+            c_ok = c_ok and ckpt["peak_gpu_mem_gb"] <= G2_B32_K2_MAX_GB
+            result = "LOCK mn2_b32_flash GRAD_CKPT_HEAD=1" if c_ok else "FAIL (OOM, also with GRAD_CKPT_HEAD=1)"
         else:
             result = "FAIL"
         out["phase_2b"] = {"result": result, "status": status, "peak_gpu_mem_gb": peak,
                            "median_step_ms": k2.get("median_step_ms"), "limit_gb": G2_B32_K2_MAX_GB}
+        if ckpt is not None:
+            out["phase_2b"]["grad_ckpt_probe"] = {k: ckpt.get(k) for k in ("status", "peak_gpu_mem_gb", "median_step_ms")}
     return out
 
 
