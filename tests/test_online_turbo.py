@@ -82,7 +82,8 @@ class _FakeDiT(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         self.last_batch_size = int(hidden_states.shape[0])
         ctx = encoder_hidden_states.mean(dim=1, keepdim=True)
-        h = self.linear(self.norm(hidden_states.to(self.norm.weight.dtype) + ctx.to(self.norm.weight.dtype)))
+        normed = self.norm(hidden_states.to(self.norm.weight.dtype) + ctx.to(self.norm.weight.dtype))
+        h = self.linear(normed.to(self.linear.weight.dtype))
         return h, [h]
 
 
@@ -332,6 +333,8 @@ def test_hf_trainer_end_to_end_with_lowmem_and_multi_noise(tmp_path: Path) -> No
         lowmem_backend="torch",
         bf16_weights=True,
         bf16_frozen_backbone=True,
+        keep_norm_fp32=True,  # opt-in (off by default): exercised here end to end
+        fused_clip=True,
         seed=7,
     )
     trainer_cls = make_online_turbo_trainer_class(transformers.Trainer, cfg)
@@ -392,7 +395,8 @@ def test_hf_trainer_end_to_end_with_lowmem_and_multi_noise(tmp_path: Path) -> No
     assert math.isfinite(float(res2.training_loss))
     raw_opt2 = getattr(trainer2.optimizer, "optimizer", trainer2.optimizer)
     assert isinstance(raw_opt2, LowMemAdamW)
-    sample_st = next(iter(raw_opt2.state.values()))
+    assert model2.action_head.vlln.weight.dtype == torch.float32
+    sample_st = next(st for p, st in raw_opt2.state.items() if p.dtype == torch.bfloat16)
     assert sample_st["qr"].dtype == torch.int8
     assert sample_st["qv"].dtype == torch.uint8
     assert sample_st["sr"].dtype == torch.float32
@@ -428,3 +432,55 @@ def test_patch_multi_noise_idempotent_double_patch() -> None:
     patch_action_head_multi_noise(ah, k_noise=4)
     assert ah._orig_forward == orig
     assert ah._k_noise == 4
+
+
+def test_wp2_features_are_opt_in_and_flash_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """keep_norm_fp32 / fused_clip default off (falsify_07-comparable LowMemAdamW numerics);
+    flash24 / flash32 pin master_weight_bits, flashoptim reads it from the environment."""
+    cfg = OnlineTurboConfig(optimizer="lowmem", bf16_weights=True)
+    assert not cfg.keep_norm_fp32 and not cfg.fused_clip
+    for var in ("GR00T_TURBO_KEEP_NORM_FP32", "GR00T_TURBO_FUSED_CLIP", "GR00T_TURBO_FLASHOPTIM_BITS"):
+        monkeypatch.delenv(var, raising=False)
+    assert not OnlineTurboConfig.from_env().keep_norm_fp32 and not OnlineTurboConfig.from_env().fused_clip
+    monkeypatch.setenv("GR00T_TURBO_KEEP_NORM_FP32", "1")
+    monkeypatch.setenv("GR00T_TURBO_FUSED_CLIP", "1")
+    env_cfg = OnlineTurboConfig.from_env()
+    assert env_cfg.keep_norm_fp32 and env_cfg.fused_clip
+
+    for kind in ("flashoptim", "flash24", "flash32"):
+        assert OnlineTurboConfig(optimizer=kind, bf16_weights=True).enabled
+    with pytest.raises(ValueError, match="drops sub-ulp updates"):
+        OnlineTurboConfig(optimizer="bnb8bit", bf16_weights=True)
+    with pytest.raises(ValueError, match="optimizer must be one of"):
+        OnlineTurboConfig(optimizer="flash16")
+
+    seen: list[int] = []
+
+    class _FakeFlashAdamW:
+        def __init__(self, groups: Any, *, master_weight_bits: int, **kw: Any) -> None:
+            seen.append(master_weight_bits)
+            self.param_groups = groups
+            self.kw = kw
+
+    monkeypatch.setitem(__import__("sys").modules, "flashoptim", types.SimpleNamespace(FlashAdamW=_FakeFlashAdamW))
+    from gr00t_lancedb.turbo import build_third_party_optimizer
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+    for kind in ("flash24", "flash32"):
+        opt = build_third_party_optimizer(kind, model, lr=1e-4, weight_decay=1e-5)
+        assert {g["weight_decay"] for g in opt.param_groups} == {1e-5, 0.0} and opt.kw["lr"] == 1e-4
+    monkeypatch.setenv("GR00T_TURBO_FLASHOPTIM_BITS", "32")
+    build_third_party_optimizer("flashoptim", model, lr=1e-4, weight_decay=1e-5)
+    assert seen == [24, 32, 32]
+    monkeypatch.setenv("GR00T_TURBO_FLASHOPTIM_BITS", "16")
+    with pytest.raises(ValueError, match="24 or 32"):
+        build_third_party_optimizer("flashoptim", model, lr=1e-4, weight_decay=1e-5)
+
+
+def test_fused_clip_hook_only_when_enabled(tmp_path: Path) -> None:
+    transformers = pytest.importorskip("transformers")
+    args = transformers.TrainingArguments(output_dir=str(tmp_path), max_steps=1, report_to="none", use_cpu=True)
+    for fused_clip in (False, True):
+        cfg = OnlineTurboConfig(optimizer="lowmem", lowmem_backend="torch", bf16_weights=True, fused_clip=fused_clip)
+        trainer = make_online_turbo_trainer_class(transformers.Trainer, cfg)(model=_FakeGr00tModel(), args=args)
+        assert bool(getattr(trainer.accelerator, "_lowmem_clip_hooked", False)) is fused_clip

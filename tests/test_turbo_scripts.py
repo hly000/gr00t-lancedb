@@ -136,7 +136,7 @@ def test_optimizer_builder_kinds():
 
 
 # ---------------------------------------------------------------------------
-# Phase-1 hardening: fused-launch bench gate, seeded eval, paired statistics, run-script gates
+# Phase-1 hardening: optimizer gate G1, seeded eval, paired statistics, run-script gates
 # ---------------------------------------------------------------------------
 
 import json  # noqa: E402
@@ -153,13 +153,21 @@ checks = _load("turbo_run_checks")
 RESULTS = SCRIPTS.parent / "results"
 
 
-def test_bench_fused_gate():
-    ok = {"lowmem_bf16": {"step_ms": 19.0, "peak_alloc_gb": 12.2, "fused": "active"}}
-    assert bench.fused_gate(ok, 25.0, 12.5) == []
-    slow = {"lowmem_bf16": {"step_ms": 56.3, "peak_alloc_gb": 12.2, "fused": "fallback: RuntimeError: x"}}
-    assert len(bench.fused_gate(slow, 25.0, 12.5)) == 2
-    assert bench.fused_gate({"lowmem_bf16": {"error": "boom"}}, 25.0, 12.5)
-    assert bench.fused_gate({}, 25.0, 12.5)
+def test_bench_gate_g1_branches():
+    def res(f_ms, f_b, l_ms):
+        return {
+            "flash_adamw_24": {"step_ms": f_ms, "with_grad_bytes_per_param": f_b},
+            "lowmem_bf16": {"step_ms": l_ms, "with_grad_bytes_per_param": 8.08},
+        }
+
+    assert bench.gate_g1(res(19.0, 7.15, 32.8))["branch"] == "A"
+    assert bench.gate_g1(res(30.0, 7.15, 31.0))["branch"] == "B"  # LowMemAdamW within 5 %: ties
+    assert bench.gate_g1(res(25.0, 7.15, 32.8))["branch"] == "UNDECIDED"  # faster but misses 22 ms
+    assert bench.gate_g1(res(19.0, 8.1, 32.8))["branch"] == "UNDECIDED"  # misses 7.2 B/param
+    assert bench.gate_g1({"flash_adamw_24": {"skipped": "flashoptim not installed"}})["branch"] == "UNDECIDED"
+    # Traffic estimates exist for every default row (the bandwidth column).
+    default_kinds = [k for k in bench.TRAFFIC_BYTES_PER_PARAM]
+    assert {"flash_adamw_24", "flash_adamw_32", "lowmem_bf16", "adamw_fp32"} <= set(default_kinds)
 
 
 def test_rollout_output_parsing_never_guesses():
@@ -292,13 +300,9 @@ def _rows(n, loss=0.5, mem=18000.0, step_s=0.33, turbo=None):
 
 
 def test_smoke_gate_catches_silent_slow_paths():
-    from gr00t_lancedb.turbo import lowmem_adamw as L
-
-    assert checks.FUSED_ACTIVE_MARKER == L.FUSED_ACTIVE_MARKER
-    assert checks.FUSED_FALLBACK_MARKER == L.FUSED_FALLBACK_MARKER
     turbo = {"enabled": True, "compile_applied": True}
-    log = f"x\n{L.FUSED_ACTIVE_MARKER}: 537 tensors\n"
-    assert checks.smoke_problems(_rows(5, turbo=turbo), log, expect_compile=True, expect_fused=True) == []
+    log = "x\n"
+    assert checks.smoke_problems(_rows(5, turbo=turbo), log, expect_compile=True) == []
 
     def has(problems, text):
         return any(text in p for p in problems)
@@ -308,9 +312,6 @@ def test_smoke_gate_catches_silent_slow_paths():
     assert has(checks.smoke_problems(_rows(5), log), "online_turbo was not active")
     skipped = {"enabled": True, "compile_applied": False, "compile_skipped_reason": "fp32 weights"}
     assert has(checks.smoke_problems(_rows(5, turbo=skipped), log, expect_compile=True), "fp32 weights")
-    fb = f"WARNING {L.FUSED_FALLBACK_MARKER}: fused multi-tensor launch unavailable (CompilationError: x)"
-    assert has(checks.smoke_problems(_rows(5, turbo=turbo), fb, expect_fused=True), "one launch per tensor")
-    assert has(checks.smoke_problems(_rows(5, turbo=turbo), "", expect_fused=True), "never became active")
     assert has(checks.smoke_problems(_rows(5, turbo=turbo), log, orig_mod_keys=["a._orig_mod.w"]), "_orig_mod")
     # stock baseline: turbo must be OFF
     assert checks.smoke_problems(_rows(5), "", expect_turbo=False) == []
@@ -355,7 +356,6 @@ with open(sys.argv[1] + "/bench_metrics.jsonl", "w") as fh:
     for i in range(int(sys.argv[2])):
         fh.write(json.dumps({"event": "step", "global_step": i + 1, "step_s": 0.3, "step_loss": 0.5, "gpu_mem_mb": 18900}) + "\n")
 PY
-echo "LOWMEM_FUSED_ACTIVE: 537 tensors"
 """
 
 
@@ -407,7 +407,7 @@ def test_proof_script_end_to_end_with_stubbed_training(tmp_path):
 
     mn2, mn4, stock, ga2 = call("mn2"), call("mn4"), call("stock"), call("stock_ga2")
     assert "GLOBAL_BATCH_SIZE=16" in mn2 and "GR00T_TURBO_MULTI_NOISE=2" in mn2 and "GR00T_TURBO_OPTIMIZER=lowmem" in mn2
-    assert "GR00T_TURBO_COMPILE_HEAD=1" in mn2 and "GR00T_TURBO_LOWMEM_FUSED=auto" in mn2
+    assert "GR00T_TURBO_COMPILE_HEAD=1" in mn2 and "GR00T_TURBO_KEEP_NORM_FP32=0" in mn2
     assert "GR00T_BENCH_SKIP_FINAL_SAVE=1" in mn2 and "MAX_STEPS=30" in mn2 and "ARGS=\n" in mn2
     assert "GLOBAL_BATCH_SIZE=8" in mn4 and "GR00T_TURBO_MULTI_NOISE=4" in mn4
     # B0: nothing of the turbo path may be on
@@ -478,7 +478,6 @@ with open(out + "/bench_metrics.jsonl", "w") as fh:
         fh.write(json.dumps({"event": "step", "global_step": i + 1, "step_s": 0.3, "step_loss": 0.5, "gpu_mem_mb": 18900}) + "\n")
 save_file({os.environ.get("STUB_KEY", "action_head.model.w"): torch.zeros(2)}, f"{out}/checkpoint-{n}/model.safetensors")
 PY
-echo "$STUB_FUSED_LINE"
 """
 
 
@@ -511,7 +510,6 @@ def test_smoke_gate_in_the_real_run_script(tmp_path):
         "COMPILE_HEAD": "1",
         "STUB_PY": sys.executable,
         "STUB_COMPILE_APPLIED": "1",
-        "STUB_FUSED_LINE": "LOWMEM_FUSED_ACTIVE: 537 tensors (1581870 programs) per launch, backend=triton",
     }
 
     def run(**over):
@@ -521,22 +519,18 @@ def test_smoke_gate_in_the_real_run_script(tmp_path):
 
     ok = run()
     assert ok.returncode == 0, ok.stdout[-3000:] + ok.stderr[-3000:]
-    assert "[Gate 1 PASS]" in ok.stdout and "compile=applied fused=active" in ok.stdout
+    assert "[Gate 1 PASS]" in ok.stdout and "compile=applied" in ok.stdout
     meta = json.loads((tmp_path / "runs" / "mn2" / "online_turbo_run.json").read_text())
     assert meta["mode"] == "mn2" and meta["compile_head"] == 1 and meta["multi_noise"] == 2
     assert not (tmp_path / "runs" / "_smoke_mn2").exists()
 
     for over, why in (
         ({"STUB_COMPILE_APPLIED": "0"}, "torch.compile was not applied (stub says no)"),
-        ({"STUB_FUSED_LINE": "LOWMEM_FUSED_FALLBACK: fused multi-tensor launch unavailable (X)"}, "one launch per tensor"),
-        ({"STUB_FUSED_LINE": "nothing"}, "never became active"),
         ({"STUB_KEY": "action_head.model._orig_mod.w"}, "_orig_mod keys leaked"),
     ):
         bad = run(RERUN="1", **over)
         assert bad.returncode != 0 and "[Gate 1 FAIL]" in bad.stdout and why in bad.stdout, (why, bad.stdout[-1500:])
         assert "[Main]" not in bad.stdout  # stopped before the training run
-    # LOWMEM_FUSED=off is an explicit choice: the gate must not demand the fused marker.
-    assert run(RERUN="1", STUB_FUSED_LINE="nothing", LOWMEM_FUSED="off").returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -669,15 +663,20 @@ def test_launcher_mem_fraction_is_strict():
 
 def test_optim_bench_table_keeps_the_single_tensor_floor_apart():
     res = {
-        "lowmem_bf16_pt": {
-            "tensors": 980, "step_ms": 56.3, "weights_plus_state_bytes_per_param": 8.06, "peak_alloc_gb": 12.2, "fused": "off"
+        "lowmem_bf16": {
+            "tensors": 537, "step_ms": 32.8, "weights_plus_state_bytes_per_param": 6.08,
+            "with_grad_bytes_per_param": 8.08, "peak_alloc_gb": 12.2, "effective_bw_gb_s": 691.7,
         },
         "torchao_8bit_fp32": {"skipped": "torchao not installed"},
-        "lowmem_bf16_1t": {"tensors": 1, "step_ms": 16.9, "weights_plus_state_bytes_per_param": 8.06, "peak_alloc_gb": 12.2},
+        "lowmem_bf16_1t": {
+            "tensors": 1, "step_ms": 16.9, "weights_plus_state_bytes_per_param": 6.06,
+            "with_grad_bytes_per_param": 8.06, "peak_alloc_gb": 15.2,
+        },
     }
     table = bench.results_table(res)
     main, floor = table.split("Single-tensor floor")
-    assert "`lowmem_bf16_pt` | 980 | 56.3" in main and "torchao not installed" in main and "_1t" not in main
+    assert "`lowmem_bf16` | 537 | 32.8 | 6.08 | 8.08 | 12.2 | 691.7 |" in main
+    assert "torchao not installed" in main and "_1t" not in main
     assert "`lowmem_bf16_1t` | 1 | 16.9" in floor
 
 
@@ -797,3 +796,168 @@ def test_run_falsify_orchestration(tmp_path):
     # A missing checkpoint stops Step 4 before any eval starts.
     res = run(frozen, STEP="4", B0_CKPT=str(tmp_path / "nope"))
     assert res.returncode == 2 and "not found" in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# docs/plans/08: full-batch modes, TRAIN_SEED, gates G2 / 2A, run_plan08.sh
+# ---------------------------------------------------------------------------
+
+gates08 = _load("plan08_gates")
+
+_STUB_ENV = r"""#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$OUT"
+{ echo "ARGS=$*"; env | grep -E '^(GR00T_TURBO_|GR00T_TRAIN_SEED=|GLOBAL_BATCH_SIZE=)' | sort; } > "$OUT.call"
+python3 - "$OUT" "$MAX_STEPS" <<'PY'
+import json, sys
+with open(sys.argv[1] + "/bench_metrics.jsonl", "w") as fh:
+    for i in range(int(sys.argv[2])):
+        fh.write(json.dumps({"event": "step", "global_step": i + 1, "step_s": 0.5, "step_loss": 0.5, "gpu_mem_mb": 19000}) + "\n")
+PY
+"""
+
+
+def test_plan08_full_batch_modes_and_train_seed(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    for name in ("run_online_turbo.sh", "turbo_run_checks.py"):
+        (repo / "scripts" / name).write_text((SCRIPTS / name).read_text())
+    stub = repo / "scripts" / "run_gr00t_finetune.sh"
+    stub.write_text(_STUB_ENV)
+    stub.chmod(0o755)
+    env = {**os.environ, "REPO_ROOT": str(repo), "GR00T_ROOT": str(tmp_path), "GR00T_ENV_FILE": str(tmp_path / "none.sh"),
+           "OUT_ROOT": str(tmp_path / "runs"), "BENCH_STEPS": "20", "SKIP_TRITON_TEST": "1"}
+    env.pop("GR00T_TRAIN_SEED", None)
+
+    def call(mode, **over):
+        res = subprocess.run(["bash", str(repo / "scripts" / "run_online_turbo.sh")], env={**env, "MODE": mode, **over},
+                             capture_output=True, text=True)
+        assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-2000:]
+        text = Path(tmp_path, "runs", f"bench_{mode}{over.get('BENCH_TAG', '')}.call").read_text()
+        return dict(line.split("=", 1) for line in text.splitlines())
+
+    want = {  # mode: (frames per micro-batch, K, optimizer, keep_norm_fp32, grad-accum args)
+        "flash24_b32": ("32", "1", "flash24", "1", ""),
+        "mn2_b32_flash": ("32", "2", "flash24", "1", ""),
+        "lowmem_only": ("32", "1", "lowmem", "0", ""),
+        "mn2_b32": ("32", "2", "lowmem", "0", ""),
+        "mn2_ga2": ("16", "2", "flash24", "1", "--gradient_accumulation_steps 2"),
+        "b16_k1_flash": ("16", "1", "flash24", "1", ""),
+        "b16_k1": ("16", "1", "lowmem", "0", ""),
+    }
+    calls = {mode: call(mode) for mode in want}
+    for mode, (b, k, opt, kn, ga) in want.items():
+        c = calls[mode]
+        assert (c["GLOBAL_BATCH_SIZE"], c["GR00T_TURBO_MULTI_NOISE"], c["GR00T_TURBO_OPTIMIZER"]) == (b, k, opt), mode
+        assert c["GR00T_TURBO_KEEP_NORM_FP32"] == kn and c["GR00T_TURBO_FUSED_CLIP"] == "0", mode
+        assert c["GR00T_TURBO_BF16_WEIGHTS"] == "1" and c["ARGS"] == ga, mode
+        assert "GR00T_TRAIN_SEED" not in c, mode  # unset: GR00T's own seed 42, like every earlier run
+    # 32 x 1 -> 32 x 2 changes only the number of noise draws
+    a, b = calls["flash24_b32"], calls["mn2_b32_flash"]
+    assert {k for k in set(a) | set(b) if a.get(k) != b.get(k)} == {"GR00T_TURBO_MULTI_NOISE"}
+    seeded = call("flash24_b32", TRAIN_SEED="100", KEEP_NORM_FP32="0", BENCH_TAG="_s100")
+    assert seeded["GR00T_TRAIN_SEED"] == "100" and seeded["GR00T_TURBO_KEEP_NORM_FP32"] == "0"
+
+
+def test_launcher_train_seed_replaces_config_data_seed():
+    calls = []
+
+    def run(config, *a, **kw):
+        calls.append(config.data.seed)
+        return "ran"
+
+    cfg = types.SimpleNamespace(data=types.SimpleNamespace(seed=42))
+    assert launcher._wrap_run_with_train_seed(run, None) is run and launcher._wrap_run_with_train_seed(run, " ") is run
+    applied = []
+    wrapped = launcher._wrap_run_with_train_seed(run, "100", lambda old, new: applied.append((old, new)))
+    assert wrapped(cfg) == "ran" and calls == [100] and cfg.data.seed == 100 and applied == [(42, 100)]
+    with pytest.raises(ValueError):
+        launcher._wrap_run_with_train_seed(run, "abc")
+
+
+def test_plan08_gate_g2():
+    def proof(*runs):
+        return {"runs": [dict(zip(("mode", "status", "peak_gpu_mem_gb"), r)) for r in runs]}
+
+    g = gates08.gate_g2(proof(("flash24_b32_cap22", "ok", 19.8), ("mn2_b32_flash_cap22", "ok", 21.5)))
+    assert g["phase_2a"]["result"] == "LOCK flash24_b32" and g["phase_2b"]["result"] == "LOCK mn2_b32_flash"
+    g = gates08.gate_g2(proof(("flash24_b32_cap22", "ok", 21.2), ("mn2_b32_flash_cap22", "oom", 22.0)))
+    assert g["phase_2a"]["result"] == "FAIL" and g["phase_2b"]["result"].startswith("OOM: needs DiT activation")
+    g = gates08.gate_g2(proof(("flash24_b32_cap22", "oom", 22.0)))
+    assert g["phase_2a"]["result"] == "FAIL" and g["phase_2b"]["result"] == "NOT RUN"
+    # an uncapped run of the same mode is not evidence for the gate
+    assert gates08.gate_g2(proof(("flash24_b32", "ok", 19.0)))["phase_2a"]["result"] == "NOT RUN"
+
+
+def _train_rows(n, mem_mb=19500.0, step_s=0.55, capped=True):
+    rows = [{"event": "cuda_mem_limit", "fraction": 0.56, "limit_gib": 22.115}] if capped else []
+    return rows + [{"event": "step", "global_step": i + 1, "step_s": step_s, "gpu_mem_mb": mem_mb} for i in range(n)]
+
+
+def test_plan08_gate_2a():
+    b0, cand = _paired(100, 70, 4, 6)  # -2 pts, p large
+    g = gates08.gate_2a(cand, b0, gates08.train_stats(_train_rows(3000)), 3000)
+    assert g["overall"] == "PASS" and g["accuracy"]["diff"] == pytest.approx(-0.02)
+    assert g["memory"]["peak_gpu_mem_gb"] == pytest.approx(19.04, abs=0.01) and g["speed"]["median_step_ms"] == 550.0
+    # each leg fails on its own
+    assert gates08.gate_2a(cand, b0, gates08.train_stats(_train_rows(3000, mem_mb=22100.0)), 3000)["memory"]["result"] == "FAIL"
+    assert gates08.gate_2a(cand, b0, gates08.train_stats(_train_rows(3000, capped=False)), 3000)["memory"]["result"] == "FAIL"
+    assert gates08.gate_2a(cand, b0, gates08.train_stats(_train_rows(2500)), 3000)["memory"]["result"] == "FAIL"
+    assert gates08.gate_2a(cand, b0, gates08.train_stats(_train_rows(3000, step_s=0.66)), 3000)["speed"]["result"] == "FAIL"
+    b0, worse = _paired(100, 70, 2, 7)  # -5 pts
+    assert gates08.gate_2a(worse, b0, gates08.train_stats(_train_rows(3000)), 3000)["accuracy"]["result"] == "FAIL"
+    b0, sig = _paired(200, 140, 0, 7)  # -3.5 pts but p < 0.05
+    assert gates08.gate_2a(sig, b0, gates08.train_stats(_train_rows(3000)), 3000)["accuracy"]["result"] == "FAIL"
+    b0, better = _paired(100, 60, 12, 1)  # significantly better: PASS, flagged
+    acc = gates08.gate_2a(better, b0, gates08.train_stats(_train_rows(3000)), 3000)["accuracy"]
+    assert acc["result"] == "PASS" and "significantly better" in acc["note"]
+
+
+_STUB_TURBO = r"""#!/usr/bin/env bash
+set -euo pipefail
+echo "$MODE ${BENCH_TAG:-} compile=${COMPILE_HEAD:-0} frac=${GR00T_CUDA_MEM_FRACTION:-none} pp=${PYTHONPATH:-}" >> "$STUB_LOG"
+d="$OUT_ROOT/bench_${MODE}${BENCH_TAG:-}"; mkdir -p "$d"
+status=ok; peak=19.6
+case "$MODE" in mn2_b32_flash) status=oom; peak=22.0 ;; flash24_b32) [ "${STUB_B32_OOM:-0}" = 1 ] && { status=oom; peak=22.1; } ;; esac
+printf '{"mode": "%s", "status": "%s", "steps_done": 50, "peak_gpu_mem_gb": %s, "cuda_mem_limit_gib": 22.1, ' \
+  "${MODE}${BENCH_TAG:-}" "$status" "$peak" > "$d/bench_summary.json"
+echo '"median_step_ms": 540.0}' >> "$d/bench_summary.json"
+"""
+
+
+def test_run_plan08_probe_flow(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    for name in ("run_plan08.sh", "turbo_run_checks.py", "plan08_gates.py", "libero_eval_stats.py"):
+        (repo / "scripts" / name).write_text((SCRIPTS / name).read_text())
+    (repo / "scripts" / "run_online_turbo.sh").write_text(_STUB_TURBO)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "nvidia-smi").write_text(
+        '#!/usr/bin/env bash\ncase "$*" in *name,memory.total*) echo "NVIDIA A100-SXM4-40GB, 40960 MiB";; *) echo smi;; esac\n'
+    )
+    (bin_dir / "uv").write_text("#!/usr/bin/env bash\nexit 0\n")  # Gate 0 pytest
+    for f in ("nvidia-smi", "uv"):
+        (bin_dir / f).chmod(0o755)
+    log = tmp_path / "calls.log"
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GR00T_ENV_FILE": str(tmp_path / "none.sh"),
+           "GR00T_ROOT": str(tmp_path), "PLAN_ROOT": str(tmp_path / "plan"), "OPTIM_BENCH": "0",
+           "FLASH_PYTHONPATH": "/opt/flashoptim", "PYTHONPATH": "", "STUB_LOG": str(log), "STEP": "probe"}
+
+    res = subprocess.run(["bash", str(repo / "scripts" / "run_plan08.sh")], env=env, capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+    calls = log.read_text().splitlines()
+    assert [c.split()[0] + c.split()[1] for c in calls] == [
+        "flash24_b32_cap22", "mn2_b32_flash_cap22", "flash24_b32_cap22_compile", "lowmem_only_cap22"]
+    assert all("frac=0.56" in c for c in calls) and "compile=1" in calls[2] and "compile=0" in calls[0]
+    assert calls[0].endswith("pp=/opt/flashoptim") and calls[3].endswith("pp=")  # flashoptim only for FlashAdamW modes
+    g2 = json.loads((tmp_path / "plan" / "probe" / "gate_g2.json").read_text())
+    assert g2["phase_2a"]["result"] == "LOCK flash24_b32" and g2["phase_2b"]["result"].startswith("OOM")
+    assert "| `mn2_b32_flash_cap22` | CUDA OOM" in (tmp_path / "plan" / "probe" / "proof_fullbatch.md").read_text()
+
+    # 32 x 1 does not fit -> the plan's 16 x 2 x GA2 fallback is probed too
+    log.unlink()
+    res = subprocess.run(["bash", str(repo / "scripts" / "run_plan08.sh")], env={**env, "STUB_B32_OOM": "1"},
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+    assert log.read_text().splitlines()[-1].startswith("mn2_ga2 _cap22")

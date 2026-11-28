@@ -22,6 +22,24 @@
 #   stock_ga2    16 frames x grad-accum 2, stock fp32 AdamW, frozen VLM cast to bf16
 #                ["just lower the batch size and cast the backbone": B1]
 #   bnb8bit      16 frames x 2 noise + bitsandbytes AdamW8bit on fp32 weights          [B2]
+# FlashAdamW (flashoptim, master_weight_bits=24, keep_norm_fp32=1; flashoptim must be importable):
+#   b16_k1_flash   16 frames x 1 noise                    [L4 runs of 2026-11-28, results/l4_24g]
+#   mn2_flash      16 frames x 2 noise                    [L4 runs of 2026-11-28]
+# Full batch, 32 frames per optimizer step like B0 (docs/plans/08):
+#   flash24_b32    32 frames x 1 noise + FlashAdamW-24    [Phase 2A]
+#   mn2_b32_flash  32 frames x 2 noise + FlashAdamW-24    [Phase 2B]
+#   lowmem_only    32 frames x 1 noise + LowMemAdamW      (listed above; no external dependency)
+#   mn2_b32        32 frames x 2 noise + LowMemAdamW
+#   mn2_ga2        16 frames x 2 noise x grad-accum 2 = 32 frames/step + FlashAdamW-24
+#                  (OPTIMIZER=lowmem for the LowMemAdamW variant) [fallback if 32 x 2 OOMs]
+#
+# Optimizer-side switches (defaults keep LowMemAdamW runs numerically equal to falsify_07):
+#   KEEP_NORM_FP32=0|1  norm parameters stay fp32 under BF16_WEIGHTS (default 1 for FlashAdamW
+#                       modes, 0 otherwise)
+#   FUSED_CLIP=0|1      clip through LowMemAdamW.clip_scale() (default 0)
+#   FLASHOPTIM_BITS     for OPTIMIZER=flashoptim (flash24 / flash32 pin it)
+#   TRAIN_SEED          GR00T's data / init / noise seed (config.data.seed); unset = GR00T's 42,
+#                       as in every earlier run. SEED only seeds LowMemAdamW's stochastic rounding.
 #
 # Usage:
 #   bash scripts/run_online_turbo.sh
@@ -60,8 +78,9 @@ EVAL_SEED_BASE="${EVAL_SEED_BASE:-20260}"
 BASELINE_EVAL="${BASELINE_EVAL:-}"
 PORT="${PORT:-5560}"
 COMPILE_HEAD="${COMPILE_HEAD:-0}"
-LOWMEM_FUSED="${LOWMEM_FUSED:-auto}"
 SEED="${SEED:-42}"
+TRAIN_SEED="${TRAIN_SEED:-}"
+FUSED_CLIP="${FUSED_CLIP:-0}"
 BENCH_STEPS="${BENCH_STEPS:-0}"
 # A bench run is itself short and may be expected to run out of memory: no smoke gate.
 if [ "$BENCH_STEPS" != "0" ]; then SMOKE="${SMOKE:-0}"; else SMOKE="${SMOKE:-1}"; fi
@@ -138,11 +157,30 @@ case "$MODE" in
     BF16_BACKBONE="${BF16_BACKBONE:-1}"
     [ "$BF16_WEIGHTS" = "1" ] && ALLOW_PURE_BF16=1
     ;;
+  b16_k1_flash|mn2_flash|flash24_b32|mn2_b32_flash|mn2_b32|mn2_ga2)
+    case "$MODE" in
+      b16_k1_flash) B=16; K=1; OPT=flash24 ;;
+      mn2_flash) B=16; K=2; OPT=flash24 ;;
+      flash24_b32) B=32; K=1; OPT=flash24 ;;
+      mn2_b32_flash) B=32; K=2; OPT=flash24 ;;
+      mn2_b32) B=32; K=2; OPT=lowmem ;;
+      mn2_ga2) B=16; K=2; OPT=flash24; EXTRA_ARGS=(--gradient_accumulation_steps "${GRAD_ACCUM:-2}") ;;
+    esac
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$B}"
+    MULTI_NOISE="${MULTI_NOISE:-$K}"
+    OPTIMIZER="${OPTIMIZER:-$OPT}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-1}"
+    BF16_BACKBONE="${BF16_BACKBONE:-1}"
+    ;;
   *)
-    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32 | b16_k1 | b16_k1_fp32 | stock | stock_ga2 | bnb8bit)" >&2
+    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32 | b16_k1 | b16_k1_fp32 | stock | stock_ga2 | bnb8bit | b16_k1_flash | mn2_flash | flash24_b32 | mn2_b32_flash | mn2_b32 | mn2_ga2)" >&2
     exit 2
     ;;
 esac
+
+case "$OPTIMIZER" in flash*) KEEP_NORM_FP32="${KEEP_NORM_FP32:-1}" ;; *) KEEP_NORM_FP32="${KEEP_NORM_FP32:-0}" ;; esac
+GRAD_ACCUM_STEPS=1
+if [ "${#EXTRA_ARGS[@]}" -ge 2 ] && [ "${EXTRA_ARGS[0]}" = "--gradient_accumulation_steps" ]; then GRAD_ACCUM_STEPS="${EXTRA_ARGS[1]}"; fi
 
 mkdir -p "$OUT_ROOT"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -165,14 +203,16 @@ export GR00T_TURBO_OPTIMIZER="$OPTIMIZER"
 export GR00T_TURBO_BF16_WEIGHTS="$BF16_WEIGHTS"
 export GR00T_TURBO_BF16_BACKBONE="$BF16_BACKBONE"
 export GR00T_TURBO_COMPILE_HEAD="$COMPILE_HEAD"
-export GR00T_TURBO_LOWMEM_FUSED="$LOWMEM_FUSED"
+export GR00T_TURBO_KEEP_NORM_FP32="$KEEP_NORM_FP32"
+export GR00T_TURBO_FUSED_CLIP="$FUSED_CLIP"
 export GR00T_TURBO_ALLOW_PURE_BF16="$ALLOW_PURE_BF16"
 export GR00T_TURBO_SEED="$SEED"
+[ -n "${FLASHOPTIM_BITS:-}" ] && export GR00T_TURBO_FLASHOPTIM_BITS="$FLASHOPTIM_BITS"
+if [ -n "$TRAIN_SEED" ]; then export GR00T_TRAIN_SEED="$TRAIN_SEED"; else unset GR00T_TRAIN_SEED; fi
 
 CHECK_FLAGS=()
 case "$MODE" in stock|b16_k1_fp32) CHECK_FLAGS+=(--no-turbo) ;; esac
 [ "$COMPILE_HEAD" = "1" ] && CHECK_FLAGS+=(--expect-compile)
-[ "$OPTIMIZER" = "lowmem" ] && [ "$LOWMEM_FUSED" != "off" ] && CHECK_FLAGS+=(--expect-fused)
 
 # ---------------------------------------------------------------------------
 # Gate 1: 5-step smoke test + checkpoint key & finite-loss verification
@@ -186,8 +226,8 @@ if [ "$SMOKE" = "1" ]; then
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
     bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$SMOKE_OUT.log"
 
-  # Also fails when COMPILE_HEAD=1 did not actually compile, or when LowMemAdamW is not
-  # running its single fused launch: both would silently produce slower numbers.
+  # Also fails when COMPILE_HEAD=1 did not actually compile (it would silently time the
+  # uncompiled head).
   (
     cd "$GR00T_ROOT"
     uv run --no-sync python "$REPO_ROOT/scripts/turbo_run_checks.py" smoke "$SMOKE_OUT" "$SMOKE_OUT.log" \
@@ -230,7 +270,7 @@ else
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
     bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$RUN_OUT.train.log"
   T1=$(date +%s)
-  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"compile_head\":$COMPILE_HEAD}" \
+  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"grad_accum\":$GRAD_ACCUM_STEPS,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"keep_norm_fp32\":$KEEP_NORM_FP32,\"fused_clip\":$FUSED_CLIP,\"compile_head\":$COMPILE_HEAD,\"train_seed\":${TRAIN_SEED:-null}}" \
     > "$RUN_OUT/online_turbo_run.json"
 fi
 [ -d "$CKPT" ] || CKPT="$RUN_OUT"

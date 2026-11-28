@@ -292,6 +292,7 @@ class LowMemAdamW(torch.optim.Optimizer):
         self.seed = int(seed)
         self.chunk_blocks = int(chunk_blocks)
         self._kernel: Callable[..., None] | None = None
+        self._pending_grad_scale: float | None = None
 
     # -- state ---------------------------------------------------------------
 
@@ -383,11 +384,14 @@ class LowMemAdamW(torch.optim.Optimizer):
         return triton_available()
 
     @torch.no_grad()
-    def step(self, closure: Callable[[], Any] | None = None, *, grad_scale: float = 1.0) -> Any:
+    def step(self, closure: Callable[[], Any] | None = None, *, grad_scale: float | None = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if grad_scale is None:
+            grad_scale = 1.0 if self._pending_grad_scale is None else self._pending_grad_scale
+        self._pending_grad_scale = None
 
         index = 0
         for group in self.param_groups:

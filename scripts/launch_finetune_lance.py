@@ -34,6 +34,10 @@ Key v1 performance / ablation env vars:
   NIC bytes in ``step.io``)
 - ``GR00T_PREEMPT_*``: see ``gr00t_lancedb.exact_resume._make_preempt_callback``
   (``GR00T_PREEMPT_CKPT_DTYPE=auto|fp32|bf16|int8``, ``GR00T_PREEMPT_DEADLINE_S`` ...)
+- ``GR00T_TRAIN_SEED`` (unset by default: GR00T's ``config.data.seed`` = 42). GR00T's
+  ``launch_finetune.py`` has no ``--seed`` flag; its seed is ``config.data.seed``, which
+  ``run()`` hands to ``set_seed()`` and ``TrainingArguments(seed=...)`` (data order, sampling,
+  augmentation, flow-matching noise). Logged as a ``train_seed`` event.
 - ``GR00T_CUDA_MEM_FRACTION`` (unset by default: no limit). ``0.6`` caps this process's CUDA
   caching allocator at 60 % of the card (24 GiB of an A100-40GB's 39.4 GiB), so a larger
   card reproduces a 24 GB card's out-of-memory point. Logged as a ``cuda_mem_limit`` event.
@@ -184,6 +188,23 @@ def _apply_cuda_mem_fraction(raw: str | None) -> dict[str, Any] | None:
         "limit_gib": round(frac * total / 2**30, 3),
         "device_total_gib": round(total / 2**30, 3),
     }
+
+
+def _wrap_run_with_train_seed(run_fn: Any, raw: str | None, on_apply: Any = None) -> Any:
+    """``run_fn`` with ``config.data.seed`` replaced by ``raw`` (unchanged when ``raw`` is empty)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return run_fn
+    seed = int(raw)
+
+    def run(config: Any, *args: Any, **kwargs: Any) -> Any:
+        previous = config.data.seed
+        config.data.seed = seed
+        if on_apply is not None:
+            on_apply(previous, seed)
+        return run_fn(config, *args, **kwargs)
+
+    return run
 
 
 def _torch_cuda_peaks() -> dict[str, float]:
@@ -1139,6 +1160,15 @@ def main() -> None:
 
     BenchTrainer.__name__ = f"Bench{trainer_cls.__name__}"
     gexp.Gr00tTrainer = BenchTrainer
+
+    def _seed_applied(previous: int, seed: int) -> None:
+        phase_box["train_seed"] = seed
+        logger.info("GR00T_TRAIN_SEED: config.data.seed %s -> %s", previous, seed)
+        _append_metric_line(metrics_path, {"event": "train_seed", "t": time.time(), "seed": seed, "replaced": previous})
+
+    # launch_finetune.py does `from gr00t.experiment.experiment import run` when it runs below,
+    # so it picks up the wrapped function.
+    gexp.run = _wrap_run_with_train_seed(gexp.run, os.environ.get("GR00T_TRAIN_SEED"), _seed_applied)
 
     script = Path(args.gr00t_root) / "gr00t" / "experiment" / "launch_finetune.py"
     sys.argv = [str(script), *gr00t_args]

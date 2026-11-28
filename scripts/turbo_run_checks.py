@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pass/fail checks and summaries for ``run_online_turbo.sh`` (standard library only).
 
-    turbo_run_checks.py smoke RUN_DIR LOG [--expect-compile] [--expect-fused]
-        5-step smoke gate: finite losses, turbo active, torch.compile really applied when it
-        was requested, fused optimizer launch really active, no ``_orig_mod`` checkpoint keys.
+    turbo_run_checks.py smoke RUN_DIR LOG [--expect-compile] [--no-turbo]
+        5-step smoke gate: finite losses, turbo active (or off for stock runs), torch.compile
+        really applied when it was requested, no ``_orig_mod`` checkpoint keys.
 
     turbo_run_checks.py bench RUN_DIR LOG --mode NAME --steps N [--out-json PATH]
         Short speed/memory run: steady step time, peak GPU memory, and whether the run ended
@@ -24,9 +24,6 @@ import statistics
 import sys
 from typing import Any
 
-# Must match gr00t_lancedb.turbo.lowmem_adamw (tests/test_turbo_scripts.py checks it).
-FUSED_ACTIVE_MARKER = "LOWMEM_FUSED_ACTIVE"
-FUSED_FALLBACK_MARKER = "LOWMEM_FUSED_FALLBACK"
 GB24_MB = 24 * 1024
 OOM_PATTERNS = ("out of memory", "outofmemoryerror")
 
@@ -54,7 +51,6 @@ def smoke_problems(
     n_steps: int = 5,
     expect_turbo: bool = True,
     expect_compile: bool = False,
-    expect_fused: bool = False,
     orig_mod_keys: list[str] | None = None,
 ) -> list[str]:
     """Everything wrong with a smoke run (empty list: the gate passes)."""
@@ -77,12 +73,6 @@ def smoke_problems(
             "COMPILE_HEAD=1 but torch.compile was not applied "
             f"({turbo.get('compile_skipped_reason') or 'no reason recorded'}); the run would be timed uncompiled"
         )
-    if expect_fused:
-        if FUSED_FALLBACK_MARKER in log_text:
-            line = next(ln for ln in log_text.splitlines() if FUSED_FALLBACK_MARKER in ln)
-            problems.append(f"LowMemAdamW fell back to one launch per tensor: {line.strip()[:300]}")
-        elif FUSED_ACTIVE_MARKER not in log_text:
-            problems.append("LowMemAdamW fused launch never became active (Triton backend not in use?)")
     if orig_mod_keys:
         problems.append(f"compiled _orig_mod keys leaked into the checkpoint: {orig_mod_keys[:5]}")
     return problems
@@ -179,7 +169,6 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--steps", type=int, default=5)
     sm.add_argument("--no-turbo", action="store_true", help="stock baseline: turbo must be off")
     sm.add_argument("--expect-compile", action="store_true")
-    sm.add_argument("--expect-fused", action="store_true")
     be = sub.add_parser("bench")
     be.add_argument("run_dir")
     be.add_argument("log")
@@ -220,7 +209,6 @@ def main(argv: list[str] | None = None) -> int:
             n_steps=args.steps,
             expect_turbo=not args.no_turbo,
             expect_compile=args.expect_compile,
-            expect_fused=args.expect_fused,
             orig_mod_keys=bad,
         )
         if n_files == 0:
@@ -233,8 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         peak = f"{max(mems):.0f} MB ({'<=24GB OK' if max(mems) <= GB24_MB else '>24GB'})" if mems else "n/a"
         print(
             f"[Gate 1 PASS] losses={[round(float(r['step_loss']), 4) for r in steps]} peak_gpu={peak} "
-            f"safetensors={n_files} (0 _orig_mod keys) compile={'applied' if args.expect_compile else 'off'} "
-            f"fused={'active' if args.expect_fused else 'n/a'}"
+            f"safetensors={n_files} (0 _orig_mod keys) compile={'applied' if args.expect_compile else 'off'}"
         )
         return 0
 
