@@ -513,19 +513,58 @@ def test_plan09_config_env_grad_ckpt_and_int8_comp(monkeypatch: pytest.MonkeyPat
     with pytest.raises(ValueError, match="ema_decay"):
         OnlineTurboConfig(ema_decay=1.0)
 
-    # apply_online_turbo enables gradient_checkpointing on action_head.model (both method & attribute paths)
+    # apply_online_turbo wraps the DiT transformer blocks (GR00T's DiT ignores a gradient_checkpointing flag)
     model = _FakeGr00tModel()
+    model.action_head.model.transformer_blocks = nn.ModuleList([nn.Linear(16, 16), nn.Linear(16, 16)])
     info = apply_online_turbo(model, OnlineTurboConfig(grad_ckpt_head=True))
-    assert info["grad_ckpt_head_applied"] is True
-    assert getattr(model.action_head.model, "gradient_checkpointing", False) is True
-
-    called: list[Any] = []
-
-    def _enable(gradient_checkpointing_kwargs: Any = None) -> None:
-        called.append(gradient_checkpointing_kwargs)
-
-    model2 = _FakeGr00tModel()
-    model2.action_head.model.gradient_checkpointing_enable = _enable  # type: ignore[attr-defined]
+    assert info["grad_ckpt_head_applied"] is True and info["grad_ckpt_dit_blocks"] == 2
+    model2 = _FakeGr00tModel()  # no transformer_blocks: reported as not applied, never claimed
     info2 = apply_online_turbo(model2, OnlineTurboConfig(grad_ckpt_head=True))
-    assert info2["grad_ckpt_head_applied"] is True
-    assert called == [{"use_reentrant": False}]
+    assert info2["grad_ckpt_head_applied"] is False and info2["grad_ckpt_dit_blocks"] == 0
+
+
+def test_checkpoint_dit_blocks_same_gradients_and_only_in_training() -> None:
+    from gr00t_lancedb.turbo import checkpoint_dit_blocks
+
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = nn.Linear(8, 8)
+            self.calls = 0
+
+        def forward(self, hidden_states: torch.Tensor, *, temb: torch.Tensor, encoder_hidden_states: Any = None) -> torch.Tensor:
+            self.calls += 1
+            return torch.tanh(self.lin(hidden_states) + temb)
+
+    def head() -> nn.Module:
+        torch.manual_seed(0)
+        ah = nn.Module()
+        ah.model = nn.Module()
+        ah.model.transformer_blocks = nn.ModuleList([_Block(), _Block()])
+        return ah
+
+    def run(ah: nn.Module) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        x = torch.ones(3, 8, requires_grad=True)
+        h = x
+        for b in ah.model.transformer_blocks:
+            h = b(h, temb=torch.full((3, 8), 0.1), encoder_hidden_states=None)
+        h.sum().backward()
+        return x.grad, [p.grad.clone() for p in ah.parameters()]
+
+    plain, ckpt = head(), head()
+    assert checkpoint_dit_blocks(ckpt) == 2 and checkpoint_dit_blocks(ckpt) == 0  # idempotent
+    gx0, g0 = run(plain)
+    gx1, g1 = run(ckpt)
+    assert torch.allclose(gx0, gx1) and all(torch.allclose(a, b) for a, b in zip(g0, g1))
+    assert [b.calls for b in ckpt.model.transformer_blocks] == [2, 2]  # forward recomputed in backward
+    for b in ckpt.model.transformer_blocks:
+        b.calls = 0
+    with torch.no_grad():
+        run_x = torch.ones(3, 8)
+        for b in ckpt.model.transformer_blocks:
+            run_x = b(run_x, temb=torch.zeros(3, 8))
+    ckpt.eval()
+    _ = ckpt.model.transformer_blocks[0](torch.ones(3, 8, requires_grad=True), temb=torch.zeros(3, 8))
+    assert [b.calls for b in ckpt.model.transformer_blocks] == [2, 1]  # plain calls outside training+grad
+    assert checkpoint_dit_blocks(nn.Linear(2, 2)) == 0
+    assert not OnlineTurboConfig().grad_ckpt_head
