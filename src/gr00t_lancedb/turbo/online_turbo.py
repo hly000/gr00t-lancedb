@@ -75,6 +75,9 @@ class OnlineTurboConfig:
     # of HF's in-place clip of bf16 gradients. Off by default for the same reason.
     fused_clip: bool = False
     compile_head: bool = False
+    # Activation checkpointing of the DiT transformer blocks (docs/plans/08 WP2 2.3): recompute
+    # each block in backward instead of keeping its activations. Off by default.
+    grad_ckpt_head: bool = False
     frozen_backbone_no_grad: bool = True
     allow_pure_bf16: bool = False
     seed: int = 42
@@ -118,6 +121,7 @@ class OnlineTurboConfig:
             keep_norm_fp32=_env_bool("GR00T_TURBO_KEEP_NORM_FP32", False),
             fused_clip=_env_bool("GR00T_TURBO_FUSED_CLIP", False),
             compile_head=_env_bool("GR00T_TURBO_COMPILE_HEAD", False),
+            grad_ckpt_head=_env_bool("GR00T_TURBO_GRAD_CKPT_HEAD", False),
             frozen_backbone_no_grad=_env_bool("GR00T_TURBO_FROZEN_BACKBONE_NO_GRAD", True),
             allow_pure_bf16=_env_bool("GR00T_TURBO_ALLOW_PURE_BF16", False),
             seed=int(os.environ.get("GR00T_TURBO_SEED", str(default_seed))),
@@ -284,6 +288,32 @@ def build_third_party_optimizer(
     raise ValueError(f"Unsupported third-party optimizer kind={kind!r}")
 
 
+def checkpoint_dit_blocks(action_head: nn.Module) -> int:
+    """Wrap every ``action_head.model.transformer_blocks[i]`` in non-reentrant activation
+    checkpointing. Active only while the block is training and autograd is on, so evaluation
+    and ``no_grad`` passes are unchanged. Idempotent; returns the number of blocks wrapped."""
+    from torch.utils.checkpoint import checkpoint
+
+    blocks = getattr(getattr(action_head, "model", None), "transformer_blocks", None)
+    if blocks is None:
+        return 0
+    wrapped = 0
+    for block in blocks:
+        if getattr(block, "_turbo_grad_ckpt", False):
+            continue
+        original = block.forward
+
+        def _forward(*args: Any, _orig: Any = original, _mod: nn.Module = block, **kwargs: Any) -> Any:
+            if _mod.training and torch.is_grad_enabled():
+                return checkpoint(_orig, *args, use_reentrant=False, **kwargs)
+            return _orig(*args, **kwargs)
+
+        block.forward = _forward  # type: ignore[method-assign]
+        block._turbo_grad_ckpt = True
+        wrapped += 1
+    return wrapped
+
+
 def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, Any]:
     """Apply online acceleration patches in place on a GR00T N1.7 model.
 
@@ -337,6 +367,9 @@ def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, An
 
             patch_action_head_multi_noise(action_head, k_noise=cfg.multi_noise, stratified=cfg.stratified)
             info["multi_noise_applied"] = True
+
+        if cfg.grad_ckpt_head:
+            info["grad_ckpt_dit_blocks"] = checkpoint_dit_blocks(action_head)
 
         if cfg.compile_head:
             dit = getattr(action_head, "model", None)

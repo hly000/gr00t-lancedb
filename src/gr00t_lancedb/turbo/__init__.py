@@ -10,6 +10,7 @@ from .online_turbo import (
     build_lowmem_optimizer,
     build_third_party_optimizer,
     cast_parameters_only,
+    checkpoint_dit_blocks,
     make_online_turbo_trainer_class,
     unwrap_compiled_action_head,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "build_lowmem_optimizer",
     "build_third_party_optimizer",
     "cast_parameters_only",
+    "checkpoint_dit_blocks",
     "make_online_turbo_trainer_class",
     "triton_available",
     "unwrap_compiled_action_head",

@@ -3,6 +3,7 @@
 #
 #   STEP=probe  bash scripts/run_plan08.sh           Phase 1: optional A100 FlashAdamW microbench
 #                                                    + 50-step probes under a 22.1 GiB cap + gate G2
+#   STEP=probe2b bash scripts/run_plan08.sh          only the 32 x 2 probe with GRAD_CKPT_HEAD=1 + gate G2
 #   STEP=train  MODE=flash24_b32 bash scripts/run_plan08.sh   3000 steps under the same cap
 #   STEP=eval   MODE=flash24_b32 bash scripts/run_plan08.sh   100 seeded episodes (pairs with falsify_07)
 #   STEP=gate   MODE=flash24_b32 bash scripts/run_plan08.sh   Gate 2A vs B0 (+ VS="name=eval.json ...")
@@ -57,6 +58,16 @@ probe() {  # probe MODE TAG [KEY=VALUE ...]
   NAMES+=("$mode$tag")
 }
 
+table_and_g2() {  # every probe run in the directory -> one table + gate G2
+  local names=() d
+  for d in "$PROBE_DIR"/bench_*/; do [ -f "$d/bench_summary.json" ] && names+=("$(basename "$d" | sed 's/^bench_//')"); done
+  GPU_NAME="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+  python3 "$REPO_ROOT/scripts/turbo_run_checks.py" table "$PROBE_DIR" "${names[@]}" \
+    --gpu "$GPU_NAME" --out-json "$PROBE_DIR/proof_fullbatch.json" | tee "$PROBE_DIR/proof_fullbatch.md"
+  python3 "$REPO_ROOT/scripts/plan08_gates.py" g2 --proof "$PROBE_DIR/proof_fullbatch.json" \
+    --out-json "$PROBE_DIR/gate_g2.json"
+}
+
 status_of() {
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status"))' "$PROBE_DIR/bench_$1/bench_summary.json" 2>/dev/null || echo missing
 }
@@ -84,15 +95,21 @@ case "$STEP" in
         probe "$mode" _cap22
       fi
     done
-    # Fallback of the plan: 16 x 2 x grad-accum 2 only when 32 x 1 does not fit.
+    # Fallbacks of the plan: 16 x 2 x grad-accum 2 only when 32 x 1 does not fit; DiT
+    # activation checkpointing when 32 x 2 does not fit.
     if [ "$(status_of flash24_b32_cap22)" != "ok" ]; then
       probe mn2_ga2 _cap22
     fi
-    GPU_NAME="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
-    python3 "$REPO_ROOT/scripts/turbo_run_checks.py" table "$PROBE_DIR" "${NAMES[@]}" \
-      --gpu "$GPU_NAME" --out-json "$PROBE_DIR/proof_fullbatch.json" | tee "$PROBE_DIR/proof_fullbatch.md"
-    python3 "$REPO_ROOT/scripts/plan08_gates.py" g2 --proof "$PROBE_DIR/proof_fullbatch.json" \
-      --out-json "$PROBE_DIR/gate_g2.json"
+    if [ "$(status_of mn2_b32_flash_cap22)" = "oom" ]; then
+      probe mn2_b32_flash _cap22_ckpt GRAD_CKPT_HEAD=1
+    fi
+    table_and_g2
+    ;;
+
+  probe2b)
+    NAMES=()
+    probe mn2_b32_flash _cap22_ckpt GRAD_CKPT_HEAD=1
+    table_and_g2
     ;;
 
   train)
@@ -128,7 +145,7 @@ case "$STEP" in
     ;;
 
   *)
-    echo "Unknown STEP=$STEP (expected probe | train | eval | gate)" >&2
+    echo "Unknown STEP=$STEP (expected probe | probe2b | train | eval | gate)" >&2
     exit 2
     ;;
 esac

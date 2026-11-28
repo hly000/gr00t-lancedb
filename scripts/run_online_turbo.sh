@@ -37,6 +37,7 @@
 #   KEEP_NORM_FP32=0|1  norm parameters stay fp32 under BF16_WEIGHTS (default 1 for FlashAdamW
 #                       modes, 0 otherwise)
 #   FUSED_CLIP=0|1      clip through LowMemAdamW.clip_scale() (default 0)
+#   GRAD_CKPT_HEAD=0|1  activation checkpointing of the DiT blocks (default 0; for 32 x 2 on 24 GB)
 #   FLASHOPTIM_BITS     for OPTIMIZER=flashoptim (flash24 / flash32 pin it)
 #   TRAIN_SEED          GR00T's data / init / noise seed (config.data.seed); unset = GR00T's 42,
 #                       as in every earlier run. SEED only seeds LowMemAdamW's stochastic rounding.
@@ -81,6 +82,7 @@ COMPILE_HEAD="${COMPILE_HEAD:-0}"
 SEED="${SEED:-42}"
 TRAIN_SEED="${TRAIN_SEED:-}"
 FUSED_CLIP="${FUSED_CLIP:-0}"
+GRAD_CKPT_HEAD="${GRAD_CKPT_HEAD:-0}"
 BENCH_STEPS="${BENCH_STEPS:-0}"
 # A bench run is itself short and may be expected to run out of memory: no smoke gate.
 if [ "$BENCH_STEPS" != "0" ]; then SMOKE="${SMOKE:-0}"; else SMOKE="${SMOKE:-1}"; fi
@@ -205,6 +207,7 @@ export GR00T_TURBO_BF16_BACKBONE="$BF16_BACKBONE"
 export GR00T_TURBO_COMPILE_HEAD="$COMPILE_HEAD"
 export GR00T_TURBO_KEEP_NORM_FP32="$KEEP_NORM_FP32"
 export GR00T_TURBO_FUSED_CLIP="$FUSED_CLIP"
+export GR00T_TURBO_GRAD_CKPT_HEAD="$GRAD_CKPT_HEAD"
 export GR00T_TURBO_ALLOW_PURE_BF16="$ALLOW_PURE_BF16"
 export GR00T_TURBO_SEED="$SEED"
 [ -n "${FLASHOPTIM_BITS:-}" ] && export GR00T_TURBO_FLASHOPTIM_BITS="$FLASHOPTIM_BITS"
@@ -270,7 +273,7 @@ else
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
     bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$RUN_OUT.train.log"
   T1=$(date +%s)
-  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"grad_accum\":$GRAD_ACCUM_STEPS,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"keep_norm_fp32\":$KEEP_NORM_FP32,\"fused_clip\":$FUSED_CLIP,\"compile_head\":$COMPILE_HEAD,\"train_seed\":${TRAIN_SEED:-null}}" \
+  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"grad_accum\":$GRAD_ACCUM_STEPS,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"keep_norm_fp32\":$KEEP_NORM_FP32,\"fused_clip\":$FUSED_CLIP,\"grad_ckpt_head\":$GRAD_CKPT_HEAD,\"compile_head\":$COMPILE_HEAD,\"train_seed\":${TRAIN_SEED:-null}}" \
     > "$RUN_OUT/online_turbo_run.json"
 fi
 [ -d "$CKPT" ] || CKPT="$RUN_OUT"
