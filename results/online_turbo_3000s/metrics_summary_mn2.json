@@ -1,0 +1,31 @@
+{
+  "num_steps": 3000,
+  "median_step_ms": 400.46,
+  "mean_step_ms": 406.15,
+  "peak_gpu_mem_mb": 18993.0,
+  "peak_gpu_mem_gb": 18.55,
+  "fits_24gb": true,
+  "final_loss_last50_mean": 0.12094,
+  "online_turbo": {
+    "multi_noise": 2,
+    "stratified": true,
+    "optimizer": "lowmem",
+    "lowmem_backend": "auto",
+    "bf16_weights": true,
+    "bf16_frozen_backbone": true,
+    "compile_head": false,
+    "frozen_backbone_no_grad": true,
+    "allow_pure_bf16": false,
+    "seed": 42,
+    "enabled": true,
+    "backbone_bf16_tensors": 493,
+    "backbone_bytes_saved_gb": 2.838,
+    "backbone_no_grad": true,
+    "action_head_bf16_tensors": 537,
+    "action_head_bytes_saved_gb": 3.018,
+    "multi_noise_applied": true,
+    "compile_applied": false,
+    "compile_skipped_reason": null,
+    "triton_available": true
+  }
+}

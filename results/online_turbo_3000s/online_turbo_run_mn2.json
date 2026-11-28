@@ -1,0 +1,1 @@
+{"mode":"mn2","train_wall_s":1401,"global_batch_size":16,"multi_noise":2,"optimizer":"lowmem","bf16_weights":1,"compile_head":0}
