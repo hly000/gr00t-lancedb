@@ -55,8 +55,9 @@ class OnlineTurboConfig:
 
     multi_noise: int = 1
     stratified: bool = True
-    optimizer: str = "native"  # "native" | "lowmem"
+    optimizer: str = "native"  # "native" | "lowmem" | "bnb8bit" (baseline: bitsandbytes AdamW8bit)
     lowmem_backend: str = "auto"  # "auto" | "triton" | "torch"
+    lowmem_fused: str = "auto"  # "auto" | "on" | "off": one kernel launch for all tensors
     bf16_weights: bool = False
     bf16_frozen_backbone: bool = False
     compile_head: bool = False
@@ -67,8 +68,10 @@ class OnlineTurboConfig:
     def __post_init__(self) -> None:
         if self.multi_noise < 1:
             raise ValueError(f"multi_noise must be >= 1, got {self.multi_noise}")
-        if self.optimizer not in ("native", "lowmem"):
-            raise ValueError(f"optimizer must be 'native' or 'lowmem', got {self.optimizer!r}")
+        if self.optimizer not in ("native", "lowmem", "bnb8bit"):
+            raise ValueError(f"optimizer must be 'native', 'lowmem' or 'bnb8bit', got {self.optimizer!r}")
+        if self.lowmem_fused not in ("auto", "on", "off"):
+            raise ValueError(f"lowmem_fused must be 'auto'|'on'|'off', got {self.lowmem_fused!r}")
         if self.lowmem_backend not in ("auto", "triton", "torch"):
             raise ValueError(f"lowmem_backend must be 'auto'|'triton'|'torch', got {self.lowmem_backend!r}")
         if self.bf16_weights and self.optimizer != "lowmem" and not self.allow_pure_bf16:
@@ -98,6 +101,7 @@ class OnlineTurboConfig:
             stratified=_env_bool("GR00T_TURBO_STRATIFIED", True),
             optimizer=os.environ.get("GR00T_TURBO_OPTIMIZER", "native").strip().lower(),
             lowmem_backend=os.environ.get("GR00T_TURBO_LOWMEM_BACKEND", "auto").strip().lower(),
+            lowmem_fused=os.environ.get("GR00T_TURBO_LOWMEM_FUSED", "auto").strip().lower(),
             bf16_weights=bf16_weights,
             bf16_frozen_backbone=bf16_backbone,
             compile_head=_env_bool("GR00T_TURBO_COMPILE_HEAD", False),
@@ -169,17 +173,8 @@ def _is_no_decay_param(name: str, param: nn.Parameter) -> bool:
     return any(tok in low for tok in _NO_DECAY_SUBSTRINGS)
 
 
-def build_lowmem_optimizer(
-    model: nn.Module,
-    *,
-    lr: float,
-    weight_decay: float,
-    betas: tuple[float, float] = (0.9, 0.999),
-    eps: float = 1e-8,
-    backend: str = "auto",
-    seed: int = 0,
-) -> LowMemAdamW:
-    """Build :class:`LowMemAdamW` with HF-Trainer-equivalent decay / no-decay param groups."""
+def _decay_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """HF-Trainer-equivalent decay / no-decay param groups over the trainable parameters."""
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
     for name, p in model.named_parameters():
@@ -196,14 +191,49 @@ def build_lowmem_optimizer(
         groups.append({"params": no_decay, "weight_decay": 0.0})
     if not groups:
         raise ValueError("model has no trainable parameters (requires_grad=True)")
+    return groups
+
+
+def build_lowmem_optimizer(
+    model: nn.Module,
+    *,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+    backend: str = "auto",
+    seed: int = 0,
+    fused: bool | None = None,
+) -> LowMemAdamW:
+    """Build :class:`LowMemAdamW` with HF-Trainer-equivalent decay / no-decay param groups."""
     return LowMemAdamW(
-        groups,
+        _decay_groups(model, weight_decay),
         lr=float(lr),
         betas=betas,
         eps=float(eps),
         weight_decay=float(weight_decay),
         backend=backend,
         seed=seed,
+        fused=fused,
+    )
+
+
+def build_bnb8bit_optimizer(
+    model: nn.Module,
+    *,
+    lr: float,
+    weight_decay: float,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+) -> Any:
+    """Baseline for comparisons: ``bitsandbytes.optim.AdamW8bit`` on the same param groups.
+
+    An explicit request never falls back: without bitsandbytes this raises ImportError.
+    """
+    import bitsandbytes as bnb
+
+    return bnb.optim.AdamW8bit(
+        _decay_groups(model, weight_decay), lr=float(lr), betas=betas, eps=float(eps), weight_decay=float(weight_decay)
     )
 
 
@@ -307,7 +337,7 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
             super().__init__(*args, **kwargs)
 
         def create_optimizer(self) -> Any:
-            if self._online_turbo_cfg.optimizer != "lowmem":
+            if self._online_turbo_cfg.optimizer == "native":
                 return super().create_optimizer()
             if self.optimizer is None:
                 betas = (
@@ -315,6 +345,16 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
                     float(getattr(self.args, "adam_beta2", 0.999)),
                 )
                 eps = float(getattr(self.args, "adam_epsilon", 1e-8))
+                if self._online_turbo_cfg.optimizer == "bnb8bit":
+                    self.optimizer = build_bnb8bit_optimizer(
+                        self.model,
+                        lr=float(self.args.learning_rate),
+                        weight_decay=float(self.args.weight_decay),
+                        betas=betas,
+                        eps=eps,
+                    )
+                    logger.info("[online-turbo] created bitsandbytes AdamW8bit (baseline, betas=%s)", betas)
+                    return self.optimizer
                 self.optimizer = build_lowmem_optimizer(
                     self.model,
                     lr=float(self.args.learning_rate),
@@ -323,10 +363,12 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
                     eps=eps,
                     backend=self._online_turbo_cfg.lowmem_backend,
                     seed=self._online_turbo_cfg.seed,
+                    fused={"auto": None, "on": True, "off": False}[self._online_turbo_cfg.lowmem_fused],
                 )
                 logger.info(
-                    "[online-turbo] created LowMemAdamW (backend=%s, betas=%s, lr=%g, wd=%g)",
+                    "[online-turbo] created LowMemAdamW (backend=%s, fused=%s, betas=%s, lr=%g, wd=%g)",
                     self.optimizer.backend,
+                    self._online_turbo_cfg.lowmem_fused,
                     betas,
                     self.args.learning_rate,
                     self.args.weight_decay,

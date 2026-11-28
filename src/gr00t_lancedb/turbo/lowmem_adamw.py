@@ -48,18 +48,45 @@ AdamW by under half of what a different minibatch order causes.
 Two interchangeable backends compute the same arithmetic:
 
 * ``torch``: chunked reference implementation, runs anywhere (CPU tests use it).
-* ``triton``: one fused pass over ``(w, c, g, q_r, q_v)`` per tensor. All codec steps are
+* ``triton``: one fused pass over ``(w, c, g, q_r, q_v)``. All codec steps are
   integer bit operations so both backends agree except for last-bit differences where the
   GPU contracts ``a*b+c`` into an FMA.
+
+Multi-tensor launch (``fused``)
+
+A Triton launch costs ~40 us of Python regardless of tensor size, so stepping the action
+head one tensor at a time spends more time launching than computing (measured on an A100:
+980 tensors 56 ms, the same 1.62 B elements as one tensor 17 ms). With ``fused`` every tensor
+that shares hyper-parameters is updated by ONE launch: the host passes a per-program tensor
+id and a small per-tensor table (element offsets of each array relative to the first tensor
+of the batch, element count, first program, seed), and each program resolves its own
+pointers from that table. Nothing is copied or concatenated: weights, gradients and state
+stay where they are, the only extra memory is the table (4 bytes per 1024 elements).
+Seeds and offsets are per tensor, so the result is the same as the per-tensor launch.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Iterable
 
 import torch
 
+logger = logging.getLogger("gr00t_lancedb.turbo.lowmem_adamw")
+
 BLOCK = 128
+KERNEL_ROWS = 8  # quantisation blocks per Triton program (both kernels)
+
+# Layout of one row of the fused-launch table (int64, one row per tensor). The first seven
+# columns are element offsets from the same array of the batch's first tensor.
+TBL_W, TBL_C, TBL_G, TBL_QR, TBL_QV, TBL_SR, TBL_SV, TBL_N, TBL_PROG0, TBL_SEED = range(10)
+TBL_COLS = 10
+_N_PTR_COLS = 7
+_MAX_NUMEL = 2**31 - 1 - KERNEL_ROWS * BLOCK  # in-kernel element offsets are int32
+
+# Grep-able markers: scripts/run_online_turbo.sh fails its smoke gate on the fallback one.
+FUSED_ACTIVE_MARKER = "LOWMEM_FUSED_ACTIVE"
+FUSED_FALLBACK_MARKER = "LOWMEM_FUSED_FALLBACK"
 _KV_BIAS = (127 - 31) << 3  # minifloat code 0 <-> 2**-31
 _X_MIN = 2.0**-31
 _X_MAX = 1.875
@@ -109,6 +136,14 @@ def step_seed(base_seed: int, step: int, tensor_index: int) -> int:
     h = mix32_py(h ^ (step & _MASK32))
     h = mix32_py(h ^ ((tensor_index * 0x9E3779B1) & _MASK32))
     return h
+
+
+def step_seeds(base_seed: int, step: int, tensor_indices: torch.Tensor) -> torch.Tensor:
+    """:func:`step_seed` for many tensors at once: int64 indices -> int32 seeds (CPU)."""
+    h = mix32_py(mix32_py(base_seed ^ 0x51ED270B) ^ (step & _MASK32))
+    term = (tensor_indices.to(torch.int64) * 0x9E3779B1) & _MASK32
+    term = torch.where(term >= (1 << 31), term - (1 << 32), term).to(torch.int32)
+    return mix32(term ^ h)
 
 
 def bf16_bits_to_f32(bits16: torch.Tensor) -> torch.Tensor:
@@ -177,17 +212,23 @@ def _update_tensor_torch(
     grad_scale: float,
     seed: int,
     chunk_blocks: int,
+    block_range: tuple[int, int] | None = None,
 ) -> None:
-    """One AdamW step for one tensor, ``chunk_blocks`` blocks at a time (bounded temporaries)."""
+    """One AdamW step for one tensor, ``chunk_blocks`` blocks at a time (bounded temporaries).
+
+    ``block_range=(first, stop)`` updates only those quantisation blocks (what one Triton
+    program does); blocks are independent, so any partition gives the same result.
+    """
     kahan = comp is not None
     n = w.numel()
     nb = sr.numel()
+    blk_first, blk_stop = (0, nb) if block_range is None else (block_range[0], min(nb, block_range[1]))
     w_flat = w.view(torch.int16).reshape(-1) if kahan else w.reshape(-1)
     c_flat = comp.view(torch.int16).reshape(-1) if kahan else None
     g_flat = grad.view(torch.int16).reshape(-1) if grad.dtype == torch.bfloat16 else grad.reshape(-1)
 
-    for b0 in range(0, nb, chunk_blocks):
-        b1 = min(nb, b0 + chunk_blocks)
+    for b0 in range(blk_first, blk_stop, chunk_blocks):
+        b1 = min(blk_stop, b0 + chunk_blocks)
         s, e = b0 * BLOCK, min(n, b1 * BLOCK)
         rows, cnt = b1 - b0, e - s
         pad = rows * BLOCK - cnt
@@ -240,6 +281,106 @@ def _update_tensor_torch(
 
 
 # ---------------------------------------------------------------------------
+# Fused multi-tensor launch: host-side plan + a CPU executor of the launch contract
+# ---------------------------------------------------------------------------
+
+
+def _ptr_itemsizes(kahan: bool) -> tuple[int, ...]:
+    """Bytes per element of (w, c, g, qr, qv, sr, sv) as the kernel addresses them."""
+    wcg = 2 if kahan else 4  # bf16 arrays are addressed through int16 views
+    return (wcg, wcg, wcg, 1, 1, 4, 4)
+
+
+class FusedUnavailable(RuntimeError):
+    """The batch cannot be expressed as one launch (e.g. an array is misaligned)."""
+
+
+class _FusedPlan:
+    """Step-invariant part of one fused launch: which program updates which tensor."""
+
+    __slots__ = ("signature", "n_programs", "prog_tid", "table", "tensor_indices")
+
+    def __init__(self, signature: tuple[Any, ...], numels: list[int], indices: list[int], device: torch.device):
+        blocks = torch.tensor([(n + BLOCK - 1) // BLOCK for n in numels], dtype=torch.int64)
+        programs = (blocks + KERNEL_ROWS - 1) // KERNEL_ROWS
+        prog0 = torch.cumsum(programs, 0) - programs
+        self.signature = signature
+        self.n_programs = int(programs.sum())
+        self.prog_tid = torch.repeat_interleave(torch.arange(len(numels), dtype=torch.int32), programs).to(device)
+        self.table = torch.zeros(len(numels), TBL_COLS, dtype=torch.int64)
+        self.table[:, TBL_N] = torch.tensor(numels, dtype=torch.int64)
+        self.table[:, TBL_PROG0] = prog0
+        self.tensor_indices = torch.tensor(indices, dtype=torch.int64)
+
+    def fill(self, addresses: list[list[int]], kahan: bool, seeds: torch.Tensor) -> torch.Tensor:
+        """Per-step columns: array offsets (in elements, from the first tensor) and seeds."""
+        addr = torch.tensor(addresses, dtype=torch.int64)
+        delta = addr - addr[0]
+        size = torch.tensor(_ptr_itemsizes(kahan), dtype=torch.int64)
+        if bool((delta % size).any()):
+            raise FusedUnavailable("an array is not element-aligned to the first tensor of its batch")
+        self.table[:, :_N_PTR_COLS] = delta // size
+        self.table[:, TBL_SEED] = seeds.to(torch.int64)
+        return self.table
+
+
+def _update_batch_emulated(
+    bases: tuple[torch.Tensor, ...],
+    prog_tid: torch.Tensor,
+    table: torch.Tensor,
+    n_programs: int,
+    kahan: bool,
+    *,
+    chunk_blocks: int = 1 << 13,
+    **kw: Any,
+) -> None:
+    """CPU executor of the fused-launch contract, for tests.
+
+    Takes exactly what the Triton kernel takes and does what each program does: look up its
+    tensor, add that tensor's offsets to the base pointers, update ``KERNEL_ROWS`` blocks.
+    Memory is reached only through ``base address + offset`` (never through the tensors the
+    plan was built from), so a wrong table shows up as a wrong result on CPU.
+    """
+    import ctypes
+
+    if any(b.is_cuda for b in bases):
+        raise RuntimeError("the emulated fused launch dereferences host addresses; use backend='triton' on CUDA")
+    sizes = _ptr_itemsizes(kahan)
+    base_addr = [b.data_ptr() for b in bases]
+    f_dtype = torch.bfloat16 if kahan else torch.float32
+    dtypes = (f_dtype, f_dtype, f_dtype, torch.int8, torch.uint8, torch.float32, torch.float32)
+    seed_kw = {k: v for k, v in kw.items() if k != "seed"}
+    cache: dict[int, tuple[Any, ...]] = {}
+
+    def _deref(col: int, tid: int, count: int) -> torch.Tensor:
+        addr = base_addr[col] + int(table[tid, col]) * sizes[col]
+        raw = (ctypes.c_char * (count * sizes[col])).from_address(addr)
+        if dtypes[col] == torch.bfloat16:
+            return torch.frombuffer(raw, dtype=torch.int16).view(torch.bfloat16)
+        return torch.frombuffer(raw, dtype=dtypes[col])
+
+    for pid in range(n_programs):
+        tid = int(prog_tid[pid])
+        n = int(table[tid, TBL_N])
+        nb = (n + BLOCK - 1) // BLOCK
+        if tid not in cache:
+            counts = (n, n, n, n, n, nb, nb)
+            arrays = [None if (col == TBL_C and not kahan) else _deref(col, tid, counts[col]) for col in range(7)]
+            cache[tid] = tuple(arrays)
+        first = (pid - int(table[tid, TBL_PROG0])) * KERNEL_ROWS
+        if first < 0 or first >= nb:
+            continue  # the kernel masks every load/store of such a program
+        seed = _i32(int(table[tid, TBL_SEED]))
+        _update_tensor_torch(
+            *cache[tid],
+            seed=seed,
+            chunk_blocks=chunk_blocks,
+            block_range=(first, first + KERNEL_ROWS),
+            **seed_kw,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Optimizer
 # ---------------------------------------------------------------------------
 
@@ -262,6 +403,12 @@ class LowMemAdamW(torch.optim.Optimizer):
             otherwise the chunked torch implementation. ``"triton"`` / ``"torch"`` force one.
         seed: stochastic-rounding stream; a run is reproducible given (seed, step count).
         chunk_blocks: torch backend only, blocks processed per temporary allocation.
+        fused: update all tensors that share hyper-parameters with one kernel launch instead
+            of one launch per tensor (same arithmetic, same seeds). ``None`` uses it whenever
+            the Triton backend runs, and reverts to per-tensor launches with one warning if
+            the fused kernel fails to build; ``True`` requires it
+            (errors propagate; with ``backend="torch"`` on CPU it runs the emulated launch
+            used by the tests); ``False`` always launches per tensor.
 
     ``step(grad_scale=...)`` multiplies every gradient inside the update (use it with
     :meth:`clip_scale` instead of rewriting bf16 gradients in place).
@@ -278,6 +425,7 @@ class LowMemAdamW(torch.optim.Optimizer):
         backend: str = "auto",
         seed: int = 0,
         chunk_blocks: int = 1 << 13,
+        fused: bool | None = None,
     ) -> None:
         if lr < 0 or eps < 0 or weight_decay < 0:
             raise ValueError("lr, eps and weight_decay must be non-negative")
@@ -291,7 +439,14 @@ class LowMemAdamW(torch.optim.Optimizer):
         self.backend = backend
         self.seed = int(seed)
         self.chunk_blocks = int(chunk_blocks)
+        self.fused = fused
         self._kernel: Callable[..., None] | None = None
+        self._batch_kernel: Callable[..., None] | None = None
+        self._plans: dict[tuple[Any, ...], _FusedPlan] = {}
+        self._fused_verified = False
+        self._fused_disabled_reason: str | None = None
+        #: launches issued by the most recent ``step()``
+        self.last_step_stats: dict[str, int] = {"fused_launches": 0, "fused_tensors": 0, "per_tensor_launches": 0}
 
     # -- state ---------------------------------------------------------------
 
@@ -301,6 +456,8 @@ class LowMemAdamW(torch.optim.Optimizer):
         if not p.is_contiguous():
             raise ValueError("LowMemAdamW needs contiguous parameters")
         n = p.numel()
+        if n > _MAX_NUMEL:
+            raise ValueError(f"LowMemAdamW supports at most {_MAX_NUMEL} elements per tensor, got {n}")
         nb = (n + BLOCK - 1) // BLOCK
         st = self.state[p]
         st["index"] = index
@@ -390,8 +547,9 @@ class LowMemAdamW(torch.optim.Optimizer):
                 loss = closure()
 
         index = 0
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
+        stats = {"fused_launches": 0, "fused_tensors": 0, "per_tensor_launches": 0}
+        batches: dict[tuple[Any, ...], list[tuple[Any, ...]]] = {}
+        for gi, group in enumerate(self.param_groups):
             for p in group["params"]:
                 index += 1
                 if p.grad is None or p.numel() == 0:
@@ -406,24 +564,141 @@ class LowMemAdamW(torch.optim.Optimizer):
                     st = self._init_state(p, index)
                 st["step"] += 1
                 t = st["step"]
-                kw = dict(
-                    lr=float(group["lr"]),
-                    beta1=float(beta1),
-                    beta2=float(beta2),
-                    eps=float(group["eps"]),
-                    weight_decay=float(group["weight_decay"]),
-                    inv_bc1=1.0 / (1.0 - beta1**t),
-                    inv_bc2=1.0 / (1.0 - beta2**t),
-                    grad_scale=float(grad_scale),
-                    seed=step_seed(self.seed, t, st["index"]),
-                )
-                args = (p.data, st.get("comp"), grad, st["qr"], st["qv"], st["sr"], st["sv"])
-                if self._use_triton(p):
-                    if self._kernel is None:
-                        from ._triton_adamw import update_tensor_triton
-
-                        self._kernel = update_tensor_triton
-                    self._kernel(*args, **kw)
+                kahan = "comp" in st
+                use_triton = self._use_triton(p)
+                item = (p, grad, st)
+                if self._wants_fused(p, use_triton):
+                    batches.setdefault((gi, kahan, t, p.device, use_triton), []).append(item)
                 else:
-                    _update_tensor_torch(*args, chunk_blocks=self.chunk_blocks, **kw)
+                    self._step_one(item, self._hyper(group, t, grad_scale), use_triton)
+                    stats["per_tensor_launches"] += 1
+
+        for (gi, kahan, t, device, use_triton), items in batches.items():
+            hyper = self._hyper(self.param_groups[gi], t, grad_scale)
+            if self._fused_disabled_reason is not None or (len(items) == 1 and self.fused is not True):
+                for item in items:
+                    self._step_one(item, hyper, use_triton)
+                stats["per_tensor_launches"] += len(items)
+            elif self._step_fused((gi, kahan, device), items, kahan, hyper, t, use_triton):
+                stats["fused_launches"] += 1
+                stats["fused_tensors"] += len(items)
+            else:
+                for item in items:
+                    self._step_one(item, hyper, use_triton)
+                stats["per_tensor_launches"] += len(items)
+        self.last_step_stats = stats
         return loss
+
+    @staticmethod
+    def _hyper(group: dict[str, Any], t: int, grad_scale: float) -> dict[str, float]:
+        beta1, beta2 = group["betas"]
+        return dict(
+            lr=float(group["lr"]),
+            beta1=float(beta1),
+            beta2=float(beta2),
+            eps=float(group["eps"]),
+            weight_decay=float(group["weight_decay"]),
+            inv_bc1=1.0 / (1.0 - beta1**t),
+            inv_bc2=1.0 / (1.0 - beta2**t),
+            grad_scale=float(grad_scale),
+        )
+
+    def _wants_fused(self, p: torch.Tensor, use_triton: bool) -> bool:
+        if self.fused is False or self._fused_disabled_reason is not None:
+            return False
+        if self.fused is True:
+            if not use_triton and p.is_cuda:
+                raise RuntimeError("fused=True with backend='torch' is CPU-only (emulated launch for tests)")
+            return True
+        return use_triton
+
+    def _step_one(self, item: tuple[Any, ...], hyper: dict[str, float], use_triton: bool) -> None:
+        p, grad, st = item
+        seed = step_seed(self.seed, st["step"], st["index"])
+        args = (p.data, st.get("comp"), grad, st["qr"], st["qv"], st["sr"], st["sv"])
+        if use_triton:
+            if self._kernel is None:
+                from ._triton_adamw import update_tensor_triton
+
+                self._kernel = update_tensor_triton
+            self._kernel(*args, seed=seed, **hyper)
+        else:
+            _update_tensor_torch(*args, seed=seed, chunk_blocks=self.chunk_blocks, **hyper)
+
+    def _step_fused(
+        self,
+        key: tuple[Any, ...],
+        items: list[tuple[Any, ...]],
+        kahan: bool,
+        hyper: dict[str, float],
+        t: int,
+        use_triton: bool,
+    ) -> bool:
+        """One launch for ``items``. Returns False (state untouched) if this optimizer has to
+        fall back to per-tensor launches; raises instead when ``fused=True`` was requested or
+        the fused kernel has already run once (a later failure is a real error)."""
+        try:
+            signature = tuple((id(p), p.numel(), st["index"]) for p, _, st in items)
+            plan = self._plans.get(key)
+            if plan is None or plan.signature != signature:
+                plan = _FusedPlan(signature, [s[1] for s in signature], [s[2] for s in signature], key[-1])
+                self._plans[key] = plan
+            # Addresses are re-read every step: gradients are fresh allocations, and a stale
+            # address would be silent memory corruption. ~7 data_ptr() calls per tensor.
+            addresses = [
+                [
+                    p.data_ptr(),
+                    st["comp"].data_ptr() if kahan else p.data_ptr(),
+                    grad.data_ptr(),
+                    st["qr"].data_ptr(),
+                    st["qv"].data_ptr(),
+                    st["sr"].data_ptr(),
+                    st["sv"].data_ptr(),
+                ]
+                for p, grad, st in items
+            ]
+            table = plan.fill(addresses, kahan, step_seeds(self.seed, t, plan.tensor_indices))
+            p0, g0, st0 = items[0]
+            bases = (p0.data, st0["comp"] if kahan else p0.data, g0, st0["qr"], st0["qv"], st0["sr"], st0["sv"])
+            if use_triton:
+                if self._batch_kernel is None:
+                    from ._triton_adamw import update_batch_triton
+
+                    self._batch_kernel = update_batch_triton
+                self._batch_kernel(bases, plan.prog_tid, table.to(key[-1]), plan.n_programs, kahan, **hyper)
+            else:
+                _update_batch_emulated(
+                    bases, plan.prog_tid, table, plan.n_programs, kahan, chunk_blocks=self.chunk_blocks, **hyper
+                )
+        except Exception as exc:
+            # Planning and kernel compilation both fail before anything is written. Once a
+            # fused launch has succeeded, a failure is no longer "this Triton cannot build it".
+            if self.fused is True or self._fused_verified:
+                raise
+            self._fused_disabled_reason = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "%s: fused multi-tensor launch unavailable (%s); using one launch per tensor "
+                "(same result, ~40 us slower per tensor per step)",
+                FUSED_FALLBACK_MARKER,
+                self._fused_disabled_reason,
+            )
+            return False
+        if not self._fused_verified:
+            self._fused_verified = True
+            logger.warning(
+                "%s: %d tensors (%d programs) per launch, backend=%s",
+                FUSED_ACTIVE_MARKER,
+                len(items),
+                plan.n_programs,
+                "triton" if use_triton else "emulated",
+            )
+        return True
+
+    @property
+    def fused_status(self) -> str:
+        """``"active"``, ``"off"``, ``"fallback: <reason>"`` or ``"pending"`` (no step yet)."""
+        if self._fused_disabled_reason is not None:
+            return f"fallback: {self._fused_disabled_reason}"
+        if self.fused is False:
+            return "off"
+        return "active" if self._fused_verified else "pending"

@@ -207,6 +207,36 @@ def test_config_validation_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.enabled and cfg.multi_noise == 2 and cfg.bf16_weights and cfg.bf16_frozen_backbone
 
 
+def test_baseline_optimizer_and_fused_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gr00t_lancedb.turbo import build_bnb8bit_optimizer, build_lowmem_optimizer
+
+    for k in list(__import__("os").environ):
+        if k.startswith("GR00T_TURBO_"):
+            monkeypatch.delenv(k, raising=False)
+    assert OnlineTurboConfig.from_env().lowmem_fused == "auto"
+    monkeypatch.setenv("GR00T_TURBO_OPTIMIZER", "bnb8bit")
+    monkeypatch.setenv("GR00T_TURBO_LOWMEM_FUSED", "off")
+    cfg = OnlineTurboConfig.from_env()
+    assert cfg.optimizer == "bnb8bit" and cfg.lowmem_fused == "off" and cfg.enabled
+    with pytest.raises(ValueError):
+        OnlineTurboConfig(lowmem_fused="maybe")
+    with pytest.raises(ValueError):  # pure-bf16 weights still need the explicit ablation switch
+        OnlineTurboConfig(optimizer="bnb8bit", bf16_weights=True)
+    OnlineTurboConfig(optimizer="bnb8bit", bf16_weights=True, allow_pure_bf16=True)
+
+    model = nn.Sequential(nn.Linear(8, 8), nn.LayerNorm(8))
+    assert build_lowmem_optimizer(model, lr=1e-3, weight_decay=0.1, backend="torch", fused=False).fused is False
+    assert build_lowmem_optimizer(model, lr=1e-3, weight_decay=0.1, backend="torch").fused is None
+    try:
+        import bitsandbytes  # noqa: F401
+    except ImportError:
+        with pytest.raises(ImportError):  # an explicit baseline request never falls back
+            build_bnb8bit_optimizer(model, lr=1e-3, weight_decay=0.1)
+    else:
+        opt = build_bnb8bit_optimizer(model, lr=1e-3, weight_decay=0.1)
+        assert [g["weight_decay"] for g in opt.param_groups] == [0.1, 0.0]
+
+
 def test_cast_parameters_only_preserves_fp32_rope_buffers() -> None:
     model = _FakeGr00tModel()
     assert model.backbone.proj.weight.dtype == torch.float32

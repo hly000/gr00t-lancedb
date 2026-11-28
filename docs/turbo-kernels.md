@@ -39,6 +39,19 @@ bf16 只有 8 位有效数字。权重 0.05 的一个 ulp 是 2.4e-4，`lr=1e-4`
 
 速度没有测过。优化器在仅动作头的一步里只占约 12%（171 ms 里的 20 ms），所以它的价值是显存，不是速度。另外内核按张量逐个发射，动作头有几百个参数张量，Python 发射开销可能有十几到几十毫秒；`bench_lowmem_adamw.py` 里的 `lowmem_bf16_1t` 一项专门用来量这个开销。
 
+## 多张量融合发射（Phase 1 新增）
+
+A100 实测（1.62B 参数）：逐张量发射 980 个张量 56.34 ms，同样大小合成 1 个张量 16.89 ms。差的 ~40 ms 全是 Python 发射开销（每次约 40 µs），不是计算。
+
+现在同一参数组、同一 dtype 的所有张量用**一次**内核发射更新：
+
+- 主机每步传一张小表（每张量一行 int64：各数组相对本批第一个张量的元素偏移、元素个数、起始 program、随机种子）和一个"program → 张量编号"的 int32 数组；每个 program 先查表拿到自己的指针，之后的算术和逐张量内核逐行相同。
+- **不拷贝、不拼接**任何权重 / 梯度 / 状态，额外显存只有那张表（每 1024 个元素 4 字节，1.62B 参数约 6 MB）。
+- 种子和元素偏移仍按张量算，所以结果和逐张量发射一致；`state_dict` 格式不变，旧 checkpoint 可以直接续训。
+- 默认 `fused=None`（自动）：融合内核编译失败时打一条 `LOWMEM_FUSED_FALLBACK` 警告并退回逐张量发射（结果相同，只是慢）。`run_online_turbo.sh` 的 Gate 1 看到这条警告会直接判失败，不会让你带着慢路径跑 3,000 步。`GR00T_TURBO_LOWMEM_FUSED=off` 可手动关闭。
+
+**没验证的部分**：融合内核同样没在 GPU 上跑过。CPU 上验证了的是主机侧全部逻辑（分批、表、种子、偏移，用"基地址 + 表内偏移"真实解引用内存，结果与逐张量逐位相同）以及两份内核的算术文本逐行相同。Triton 能否编译"指针 + 表里读出的 int64 偏移"这种寻址、以及实际能快到多少，要等 Gate 0 和 `bench_lowmem_adamw.py --require-fused`。目标 ≤ 25 ms 是目标，不是测量值。
+
 ## 上 GPU 的顺序
 
 Triton 内核**没有在任何 GPU 上跑过**（本机没有 CUDA）。第一步必须是对拍测试：
@@ -47,8 +60,9 @@ Triton 内核**没有在任何 GPU 上跑过**（本机没有 CUDA）。第一�
 # 1. 约 30 秒：Triton 内核和 CPU 参考实现逐元素对拍。不过就不要往下跑
 pytest tests/test_turbo_lowmem_adamw.py -k triton -q
 
-# 2. 约 1 分钟：动作头真实形状下的每步耗时和显存
-python scripts/bench_lowmem_adamw.py --base-model-path nvidia/GR00T-N1.7-3B --out-json bench_adamw.json
+# 2. 约 1 分钟：动作头真实形状下的每步耗时和显存；--require-fused 是门禁
+#    （融合发射必须生效，且 lowmem_bf16 ≤ 25 ms、峰值 ≤ 12.5 GB，否则退出码非 0）
+python scripts/bench_lowmem_adamw.py --base-model-path nvidia/GR00T-N1.7-3B --require-fused --out-json bench_adamw.json
 
 # 3. 约 5 分钟：原生口径（fp32 权重 + bf16 autocast）的热点剖析
 python scripts/profile_kernels.py --out-dir /data/runs/profile_kernels
