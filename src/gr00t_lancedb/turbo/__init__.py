@@ -4,5 +4,23 @@
 from __future__ import annotations
 
 from .lowmem_adamw import BLOCK, LowMemAdamW, triton_available
+from .online_turbo import (
+    OnlineTurboConfig,
+    apply_online_turbo,
+    build_lowmem_optimizer,
+    cast_parameters_only,
+    make_online_turbo_trainer_class,
+    unwrap_compiled_action_head,
+)
 
-__all__ = ["BLOCK", "LowMemAdamW", "triton_available"]
+__all__ = [
+    "BLOCK",
+    "LowMemAdamW",
+    "OnlineTurboConfig",
+    "apply_online_turbo",
+    "build_lowmem_optimizer",
+    "cast_parameters_only",
+    "make_online_turbo_trainer_class",
+    "triton_available",
+    "unwrap_compiled_action_head",
+]

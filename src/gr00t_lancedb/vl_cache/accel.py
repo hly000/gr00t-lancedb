@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import shutil
 import types
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -90,9 +90,11 @@ def patch_action_head_multi_noise(
     if k_noise <= 1:
         return action_head
 
-    orig_forward = action_head.forward
+    orig_forward = getattr(action_head, "_orig_forward", action_head.forward)
 
     def _forward_multi_noise(self: Any, backbone_output: Any, action_input: Any) -> dict[str, Any]:
+        if not self.training:
+            return orig_forward(backbone_output, action_input)
         self.set_frozen_modules_to_eval_mode()
         backbone_output = self.process_backbone_output(backbone_output)
 
@@ -202,8 +204,9 @@ def patch_action_head_multi_noise(
         if strict_action_mask is not None:
             pred_actions = pred_actions * strict_action_mask
 
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        action_mask_f = action_mask.float()
+        action_loss = F.mse_loss(pred_actions.float(), velocity.float(), reduction="none") * action_mask_f
+        loss = action_loss.sum() / (action_mask_f.sum() + 1e-6)
         return {
             "loss": loss,
             "action_loss": action_loss,

@@ -215,11 +215,15 @@ def _update_tensor_torch(
             eff = _load(w_flat).to(torch.float32)
         new = eff - lr * (upd + weight_decay * eff)
 
+        if pad:
+            v[-1, BLOCK - pad :] = 0.0
         offsets = torch.arange(s, s + rows * BLOCK, dtype=torch.int32, device=w.device).reshape(rows, BLOCK)
         rand20, u24 = _randoms(offsets, seed)
         kv, sv_new = encode_v(v, rand20)
         v_hat = decode_v(kv, sv_new)
         r = torch.where(v_hat > 0, m / torch.sqrt(v_hat), torch.zeros_like(m))
+        if pad:
+            r[-1, BLOCK - pad :] = 0.0
         kr, sr_new = encode_r(r, u24)
 
         if kahan:
@@ -324,15 +328,27 @@ class LowMemAdamW(torch.optim.Optimizer):
 
         Returns ``(norm, scale)``; pass ``scale`` to ``step(grad_scale=scale)``.
         """
-        norms = [
-            torch.linalg.vector_norm(p.grad, dtype=torch.float32)
+        grads = [
+            p.grad
             for group in self.param_groups
             for p in group["params"]
-            if p.grad is not None
+            if p.grad is not None and p.grad.numel() > 0
         ]
-        if not norms:
+        if not grads:
             return 0.0, 1.0
-        norm = float(torch.linalg.vector_norm(torch.stack(norms)))
+        by_key: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+        for g in grads:
+            by_key.setdefault((g.device, g.dtype), []).append(g)
+        norms: list[torch.Tensor] = []
+        for (_, dtype), bucket in by_key.items():
+            # _foreach_norm avoids ~300 per-tensor kernel launches on the GR00T action head.
+            # For fp32 grads it accumulates in fp32 directly; for bf16 we keep fp32 accumulation
+            # via vector_norm only if _foreach_norm is unavailable, or upcast small norms to fp32.
+            if hasattr(torch, "_foreach_norm") and dtype == torch.float32:
+                norms.extend(n.to(torch.float32) for n in torch._foreach_norm(bucket, 2.0))
+            else:
+                norms.extend(torch.linalg.vector_norm(g, dtype=torch.float32) for g in bucket)
+        norm = float(torch.linalg.vector_norm(torch.stack([n.to(norms[0].device) for n in norms])))
         return norm, min(1.0, float(max_norm) / (norm + 1e-6))
 
     @torch.no_grad()
@@ -378,7 +394,7 @@ class LowMemAdamW(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             for p in group["params"]:
                 index += 1
-                if p.grad is None:
+                if p.grad is None or p.numel() == 0:
                     continue
                 grad = p.grad
                 if grad.is_sparse:

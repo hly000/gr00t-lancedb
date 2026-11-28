@@ -265,6 +265,7 @@ _STARTUP_KEYS = (
     "async_prefetch",
     "resuming",
     "decode_batch",
+    "online_turbo",
 )
 
 
@@ -925,6 +926,11 @@ def main() -> None:
         raise ValueError(f"GR00T_LANCE_ASYNC_PREFETCH must be auto|1|0, got {prefetch_setting!r}")
 
     trainer_cls = base_trainer
+    from gr00t_lancedb.turbo import OnlineTurboConfig, make_online_turbo_trainer_class
+
+    turbo_cfg = OnlineTurboConfig.from_env()
+    if turbo_cfg.enabled:
+        trainer_cls = make_online_turbo_trainer_class(trainer_cls, turbo_cfg)
     sample_fps_on = os.environ.get("GR00T_SAMPLE_FINGERPRINTS", "0") == "1"
 
     class BenchTrainer(trainer_cls):  # type: ignore[misc, valid-type]
@@ -938,6 +944,8 @@ def main() -> None:
             else:
                 phase_box["mp_ctx"] = kw.get("multiprocessing_context", "fork")
             super().__init__(*a, **kw)
+            if getattr(self, "_online_turbo_info", None):
+                phase_box["online_turbo"] = self._online_turbo_info
             if backend == "lance":
                 import gr00t_lancedb
 

@@ -108,6 +108,7 @@ def _lowmem_adamw_kernel(
     u24 = ((h2 >> 8) & 0xFFFFFF).to(tl.float32) * (1.0 / 16777216.0)
 
     # second moment -> minifloat, stochastic rounding on the 20 dropped mantissa bits
+    v = tl.where(mask, v, 0.0)
     sv_new = tl.max(v, axis=1) * (1.0 / X_MAX)
     sv_b = sv_new[:, None]
     x = tl.where(sv_b > 0.0, v / sv_b, 0.0)
@@ -118,7 +119,7 @@ def _lowmem_adamw_kernel(
     v_hat = ((kv + KV_BIAS) << 20).to(tl.float32, bitcast=True) * sv_b
 
     # normalised momentum -> int8, stochastic rounding
-    r = tl.where(v_hat > 0.0, m / tl.sqrt(v_hat), 0.0)
+    r = tl.where(mask & (v_hat > 0.0), m / tl.sqrt(v_hat), 0.0)
     sr_new = tl.max(tl.abs(r), axis=1)
     sr_b = sr_new[:, None]
     y = tl.where(sr_b > 0.0, r / sr_b, 0.0) * 127.0 + 127.0
@@ -160,6 +161,8 @@ def update_tensor_triton(
 ) -> None:
     kahan = comp is not None
     n = w.numel()
+    if n == 0:
+        return
     if kahan:
         w_arg, c_arg, g_arg = w.view(torch.int16), comp.view(torch.int16), grad.view(torch.int16)
     else:
