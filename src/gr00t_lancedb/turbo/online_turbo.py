@@ -473,17 +473,26 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
                         ema_dir = Path(args.output_dir) / f"checkpoint-{step}-ema"
                         with ema.swap_into_model():
                             trainer_self.save_model(str(ema_dir))
-                        if raw_dir.is_dir() and ema_dir.is_dir():
-                            for item in raw_dir.iterdir():
-                                dst = ema_dir / item.name
-                                if dst.exists() or item.name in skip_names:
+                        if ema_dir.is_dir():
+                            # Copy GR00T sidecar metadata from raw_dir AND from output_dir/{processor,experiment_cfg}
+                            # (GR00T's own CheckpointCallback may copy processor files into raw_dir after this callback).
+                            out_root = Path(args.output_dir)
+                            for src_dir in (raw_dir, out_root / "processor"):
+                                if not src_dir.is_dir():
                                     continue
-                                if item.suffix in (".safetensors", ".bin") or item.name.endswith(".index.json"):
-                                    continue
-                                if item.is_dir():
-                                    shutil.copytree(item, dst, dirs_exist_ok=True)
-                                elif item.is_file():
-                                    shutil.copy2(item, dst)
+                                for item in src_dir.iterdir():
+                                    dst = ema_dir / item.name
+                                    if dst.exists() or item.name in skip_names:
+                                        continue
+                                    if item.suffix in (".safetensors", ".bin") or item.name.endswith(".index.json"):
+                                        continue
+                                    if item.is_dir():
+                                        shutil.copytree(item, dst, dirs_exist_ok=True)
+                                    elif item.is_file():
+                                        shutil.copy2(item, dst)
+                            exp_cfg = out_root / "experiment_cfg"
+                            if exp_cfg.is_dir() and not (ema_dir / "experiment_cfg").exists():
+                                shutil.copytree(exp_cfg, ema_dir / "experiment_cfg", dirs_exist_ok=True)
                         logger.info("[cpu-ema] saved EMA checkpoint -> %s (updates=%d)", ema_dir, ema.num_updates)
                     finally:
                         self._saving_ema = False

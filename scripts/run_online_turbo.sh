@@ -337,6 +337,10 @@ PY
   fi
 
   if [ -d "${CKPT}-ema" ]; then
+    for meta in processor_config.json statistics.json embodiment_id.json wandb_config.json; do
+      [ -f "$CKPT/$meta" ] && [ ! -f "${CKPT}-ema/$meta" ] && cp -a "$CKPT/$meta" "${CKPT}-ema/$meta"
+    done
+    [ -d "$CKPT/experiment_cfg" ] && [ ! -d "${CKPT}-ema/experiment_cfg" ] && cp -a "$CKPT/experiment_cfg" "${CKPT}-ema/experiment_cfg"
     echo "================ [Eval-EMA] LIBERO-10 closed-loop (${MODE}_ema, ${N_EPISODES} ep/task, n_envs=${N_ENVS}) ================"
     cd "$GR00T_ROOT"
     uv run --no-sync python "$REPO_ROOT/scripts/eval_libero10_checkpoint.py" \
