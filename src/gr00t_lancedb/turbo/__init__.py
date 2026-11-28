@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from .ema import CpuShadowEMA
 from .lowmem_adamw import BLOCK, LowMemAdamW, triton_available
 from .online_turbo import (
     OnlineTurboConfig,
@@ -16,6 +17,7 @@ from .online_turbo import (
 
 __all__ = [
     "BLOCK",
+    "CpuShadowEMA",
     "LowMemAdamW",
     "OnlineTurboConfig",
     "apply_online_turbo",

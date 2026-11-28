@@ -80,7 +80,6 @@ PORT="${PORT:-5560}"
 COMPILE_HEAD="${COMPILE_HEAD:-0}"
 SEED="${SEED:-42}"
 TRAIN_SEED="${TRAIN_SEED:-}"
-FUSED_CLIP="${FUSED_CLIP:-0}"
 BENCH_STEPS="${BENCH_STEPS:-0}"
 # A bench run is itself short and may be expected to run out of memory: no smoke gate.
 if [ "$BENCH_STEPS" != "0" ]; then SMOKE="${SMOKE:-0}"; else SMOKE="${SMOKE:-1}"; fi
@@ -172,13 +171,37 @@ case "$MODE" in
     BF16_WEIGHTS="${BF16_WEIGHTS:-1}"
     BF16_BACKBONE="${BF16_BACKBONE:-1}"
     ;;
+  lowmem24_b32|lowmem24_b16_ga2|lowmem24_mn2_b32|lowmem24_mn2_ga2|lowmem24_mn4_ga2)
+    case "$MODE" in
+      lowmem24_b32) B=32; K=1; GC=0 ;;
+      lowmem24_b16_ga2) B=16; K=1; GC=0; EXTRA_ARGS=(--gradient_accumulation_steps "${GRAD_ACCUM:-2}") ;;
+      lowmem24_mn2_b32) B=32; K=2; GC=1 ;;
+      lowmem24_mn2_ga2) B=16; K=2; GC=0; EXTRA_ARGS=(--gradient_accumulation_steps "${GRAD_ACCUM:-2}") ;;
+      lowmem24_mn4_ga2) B=8; K=4; GC=0; EXTRA_ARGS=(--gradient_accumulation_steps "${GRAD_ACCUM:-2}") ;;
+    esac
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$B}"
+    MULTI_NOISE="${MULTI_NOISE:-$K}"
+    OPTIMIZER="${OPTIMIZER:-lowmem}"
+    BF16_WEIGHTS="${BF16_WEIGHTS:-1}"
+    BF16_BACKBONE="${BF16_BACKBONE:-1}"
+    LOWMEM_COMP="${LOWMEM_COMP:-int8}"
+    KEEP_NORM_FP32="${KEEP_NORM_FP32:-1}"
+    FUSED_CLIP="${FUSED_CLIP:-1}"
+    GRAD_CKPT_HEAD="${GRAD_CKPT_HEAD:-$GC}"
+    EMA_DECAY="${EMA_DECAY:-0.995}"
+    ;;
   *)
-    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32 | b16_k1 | b16_k1_fp32 | stock | stock_ga2 | bnb8bit | b16_k1_flash | mn2_flash | flash24_b32 | mn2_b32_flash | mn2_b32 | mn2_ga2)" >&2
+    echo "Unknown MODE=$MODE (expected mn2 | mn4 | lowmem_only | mn2_fp32 | b16_k1 | b16_k1_fp32 | stock | stock_ga2 | bnb8bit | b16_k1_flash | mn2_flash | flash24_b32 | mn2_b32_flash | mn2_b32 | mn2_ga2 | lowmem24_b32 | lowmem24_b16_ga2 | lowmem24_mn2_b32 | lowmem24_mn2_ga2 | lowmem24_mn4_ga2)" >&2
     exit 2
     ;;
 esac
 
 case "$OPTIMIZER" in flash*) KEEP_NORM_FP32="${KEEP_NORM_FP32:-1}" ;; *) KEEP_NORM_FP32="${KEEP_NORM_FP32:-0}" ;; esac
+FUSED_CLIP="${FUSED_CLIP:-0}"
+LOWMEM_COMP="${LOWMEM_COMP:-bf16}"
+GRAD_CKPT_HEAD="${GRAD_CKPT_HEAD:-0}"
+EMA_DECAY="${EMA_DECAY:-0}"
+EMA_EVERY="${EMA_EVERY:-10}"
 GRAD_ACCUM_STEPS=1
 if [ "${#EXTRA_ARGS[@]}" -ge 2 ] && [ "${EXTRA_ARGS[0]}" = "--gradient_accumulation_steps" ]; then GRAD_ACCUM_STEPS="${EXTRA_ARGS[1]}"; fi
 
@@ -200,11 +223,15 @@ fi
 export GR00T_TURBO_MULTI_NOISE="$MULTI_NOISE"
 export GR00T_TURBO_STRATIFIED=1
 export GR00T_TURBO_OPTIMIZER="$OPTIMIZER"
+export GR00T_TURBO_LOWMEM_COMP="$LOWMEM_COMP"
 export GR00T_TURBO_BF16_WEIGHTS="$BF16_WEIGHTS"
 export GR00T_TURBO_BF16_BACKBONE="$BF16_BACKBONE"
 export GR00T_TURBO_COMPILE_HEAD="$COMPILE_HEAD"
 export GR00T_TURBO_KEEP_NORM_FP32="$KEEP_NORM_FP32"
 export GR00T_TURBO_FUSED_CLIP="$FUSED_CLIP"
+export GR00T_TURBO_GRAD_CKPT_HEAD="$GRAD_CKPT_HEAD"
+export GR00T_TURBO_EMA_DECAY="$EMA_DECAY"
+export GR00T_TURBO_EMA_EVERY="$EMA_EVERY"
 export GR00T_TURBO_ALLOW_PURE_BF16="$ALLOW_PURE_BF16"
 export GR00T_TURBO_SEED="$SEED"
 [ -n "${FLASHOPTIM_BITS:-}" ] && export GR00T_TURBO_FLASHOPTIM_BITS="$FLASHOPTIM_BITS"
@@ -270,7 +297,7 @@ else
     GLOBAL_BATCH_SIZE="$GLOBAL_BATCH_SIZE" NUM_WORKERS="$NUM_WORKERS" \
     bash "$REPO_ROOT/scripts/run_gr00t_finetune.sh" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$RUN_OUT.train.log"
   T1=$(date +%s)
-  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"grad_accum\":$GRAD_ACCUM_STEPS,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"bf16_weights\":$BF16_WEIGHTS,\"keep_norm_fp32\":$KEEP_NORM_FP32,\"fused_clip\":$FUSED_CLIP,\"compile_head\":$COMPILE_HEAD,\"train_seed\":${TRAIN_SEED:-null}}" \
+  echo "{\"mode\":\"$MODE\",\"train_wall_s\":$((T1 - T0)),\"global_batch_size\":$GLOBAL_BATCH_SIZE,\"grad_accum\":$GRAD_ACCUM_STEPS,\"multi_noise\":$MULTI_NOISE,\"optimizer\":\"$OPTIMIZER\",\"lowmem_comp\":\"$LOWMEM_COMP\",\"bf16_weights\":$BF16_WEIGHTS,\"keep_norm_fp32\":$KEEP_NORM_FP32,\"fused_clip\":$FUSED_CLIP,\"grad_ckpt_head\":$GRAD_CKPT_HEAD,\"ema_decay\":$EMA_DECAY,\"compile_head\":$COMPILE_HEAD,\"train_seed\":${TRAIN_SEED:-null}}" \
     > "$RUN_OUT/online_turbo_run.json"
 fi
 [ -d "$CKPT" ] || CKPT="$RUN_OUT"
@@ -307,5 +334,35 @@ PY
   if [ -n "$BASELINE_EVAL" ]; then
     python3 "$REPO_ROOT/scripts/compare_libero_evals.py" --baseline "$BASELINE_EVAL" \
       "$MODE=$RUN_OUT/eval.json" --out-json "$RUN_OUT/eval_vs_baseline.json"
+  fi
+
+  if [ -d "${CKPT}-ema" ]; then
+    echo "================ [Eval-EMA] LIBERO-10 closed-loop (${MODE}_ema, ${N_EPISODES} ep/task, n_envs=${N_ENVS}) ================"
+    cd "$GR00T_ROOT"
+    uv run --no-sync python "$REPO_ROOT/scripts/eval_libero10_checkpoint.py" \
+      --gr00t-root "$GR00T_ROOT" \
+      --model-path "${CKPT}-ema" \
+      --n-episodes "$N_EPISODES" \
+      --n-envs "$N_ENVS" \
+      --seed-base "$EVAL_SEED_BASE" \
+      --port "$PORT" \
+      --out-json "$RUN_OUT/eval_ema.json"
+
+    python3 - "$RUN_OUT" <<'PY'
+import json, sys
+from pathlib import Path
+run_dir = Path(sys.argv[1])
+ev = json.loads((run_dir / "eval_ema.json").read_text())
+sr = ev.get("mean_success_rate")
+sr_s = f"{100.0 * sr:.2f}%" if sr is not None else "FAILED (null)"
+ci = ev.get("ci95")
+n_s = f" ({ev.get('successes')}/{ev.get('valid_episodes')}, 95% CI {ci})" if ci else ""
+print(f"\n[SUMMARY-EMA] mode={run_dir.name}_ema | LIBERO-10={sr_s}{n_s}")
+PY
+
+    if [ -n "$BASELINE_EVAL" ]; then
+      python3 "$REPO_ROOT/scripts/compare_libero_evals.py" --baseline "$BASELINE_EVAL" \
+        "${MODE}_ema=$RUN_OUT/eval_ema.json" --out-json "$RUN_OUT/eval_ema_vs_baseline.json"
+    fi
   fi
 fi

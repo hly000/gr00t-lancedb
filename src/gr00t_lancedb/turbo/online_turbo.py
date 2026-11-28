@@ -25,11 +25,14 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import logging
 import os
+from pathlib import Path
+import shutil
 from typing import Any, Iterator
 
 import torch
 import torch.nn as nn
 
+from .ema import CpuShadowEMA
 from .lowmem_adamw import LowMemAdamW, triton_available
 
 logger = logging.getLogger("gr00t_lancedb.turbo.online")
@@ -66,14 +69,18 @@ class OnlineTurboConfig:
     # "flash24" | "flash32" (explicit master_weight_bits), "bnb8bit", "torchao8bit"
     optimizer: str = "native"
     lowmem_backend: str = "auto"  # "auto" | "triton" | "torch"
+    lowmem_comp: str = "bf16"  # "bf16" | "int8" (int8 ULP-relative saves 1 B/param -> 7.06 B/param)
     bf16_weights: bool = False
     bf16_frozen_backbone: bool = False
     # Off by default so LowMemAdamW runs stay numerically comparable with falsify_07 (93abd3a);
-    # the FlashAdamW modes of run_online_turbo.sh turn it on (as in the L4 runs).
+    # the FlashAdamW and lowmem24_* modes of run_online_turbo.sh turn it on.
     keep_norm_fp32: bool = False
     # Clip through LowMemAdamW.clip_scale() (gradient scale applied inside the update) instead
     # of HF's in-place clip of bf16 gradients. Off by default for the same reason.
     fused_clip: bool = False
+    grad_ckpt_head: bool = False
+    ema_decay: float = 0.0
+    ema_update_every: int = 10
     compile_head: bool = False
     frozen_backbone_no_grad: bool = True
     allow_pure_bf16: bool = False
@@ -86,6 +93,12 @@ class OnlineTurboConfig:
             raise ValueError(f"optimizer must be one of {OPTIMIZERS}, got {self.optimizer!r}")
         if self.lowmem_backend not in ("auto", "triton", "torch"):
             raise ValueError(f"lowmem_backend must be 'auto'|'triton'|'torch', got {self.lowmem_backend!r}")
+        if self.lowmem_comp not in ("bf16", "int8"):
+            raise ValueError(f"lowmem_comp must be 'bf16' or 'int8', got {self.lowmem_comp!r}")
+        if not (0.0 <= self.ema_decay < 1.0):
+            raise ValueError(f"ema_decay must be in [0, 1), got {self.ema_decay}")
+        if self.ema_update_every < 1:
+            raise ValueError(f"ema_update_every must be >= 1, got {self.ema_update_every}")
         if self.bf16_weights and self.optimizer not in COMPENSATED_BF16_OPTIMIZERS and not self.allow_pure_bf16:
             raise ValueError(
                 "bf16_weights=True without optimizer='lowmem' (or 'flashoptim') drops sub-ulp updates in pure bf16 "
@@ -100,6 +113,8 @@ class OnlineTurboConfig:
             or self.optimizer != "native"
             or self.bf16_weights
             or self.bf16_frozen_backbone
+            or self.grad_ckpt_head
+            or self.ema_decay > 0.0
             or self.compile_head
         )
 
@@ -113,10 +128,14 @@ class OnlineTurboConfig:
             stratified=_env_bool("GR00T_TURBO_STRATIFIED", True),
             optimizer=os.environ.get("GR00T_TURBO_OPTIMIZER", "native").strip().lower(),
             lowmem_backend=os.environ.get("GR00T_TURBO_LOWMEM_BACKEND", "auto").strip().lower(),
+            lowmem_comp=os.environ.get("GR00T_TURBO_LOWMEM_COMP", "bf16").strip().lower(),
             bf16_weights=bf16_weights,
             bf16_frozen_backbone=bf16_backbone,
             keep_norm_fp32=_env_bool("GR00T_TURBO_KEEP_NORM_FP32", False),
             fused_clip=_env_bool("GR00T_TURBO_FUSED_CLIP", False),
+            grad_ckpt_head=_env_bool("GR00T_TURBO_GRAD_CKPT_HEAD", False),
+            ema_decay=float(os.environ.get("GR00T_TURBO_EMA_DECAY", "0.0")),
+            ema_update_every=int(os.environ.get("GR00T_TURBO_EMA_EVERY", "10")),
             compile_head=_env_bool("GR00T_TURBO_COMPILE_HEAD", False),
             frozen_backbone_no_grad=_env_bool("GR00T_TURBO_FROZEN_BACKBONE_NO_GRAD", True),
             allow_pure_bf16=_env_bool("GR00T_TURBO_ALLOW_PURE_BF16", False),
@@ -232,6 +251,7 @@ def build_lowmem_optimizer(
     betas: tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
     backend: str = "auto",
+    comp_dtype: str = "bf16",
     seed: int = 0,
 ) -> LowMemAdamW:
     """Build :class:`LowMemAdamW` with HF-Trainer-equivalent decay / no-decay param groups."""
@@ -243,6 +263,7 @@ def build_lowmem_optimizer(
         eps=float(eps),
         weight_decay=float(weight_decay),
         backend=backend,
+        comp_dtype=comp_dtype,
         seed=seed,
     )
 
@@ -299,6 +320,7 @@ def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, An
         "action_head_bf16_tensors": 0,
         "action_head_bytes_saved_gb": 0.0,
         "multi_noise_applied": False,
+        "grad_ckpt_head_applied": False,
         "compile_applied": False,
         "compile_skipped_reason": None,
         "triton_available": triton_available(),
@@ -337,6 +359,22 @@ def apply_online_turbo(model: nn.Module, cfg: OnlineTurboConfig) -> dict[str, An
 
             patch_action_head_multi_noise(action_head, k_noise=cfg.multi_noise, stratified=cfg.stratified)
             info["multi_noise_applied"] = True
+
+        if cfg.grad_ckpt_head:
+            dit = getattr(action_head, "model", None)
+            if dit is not None:
+                if hasattr(dit, "gradient_checkpointing_enable"):
+                    try:
+                        dit.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    except TypeError:
+                        dit.gradient_checkpointing_enable()
+                else:
+                    dit.gradient_checkpointing = True
+                info["grad_ckpt_head_applied"] = True
+                if cfg.compile_head:
+                    logger.warning(
+                        "[online-turbo] grad_ckpt_head=True with compile_head=True may conflict or slow down compilation"
+                    )
 
         if cfg.compile_head:
             dit = getattr(action_head, "model", None)
@@ -390,9 +428,67 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
             model = kwargs.get("model") if "model" in kwargs else (args[0] if args else None)
             self._online_turbo_cfg = cfg
             self._online_turbo_info = apply_online_turbo(model, cfg) if model is not None else {}
+            self._cpu_ema: CpuShadowEMA | None = None
             super().__init__(*args, **kwargs)
             if cfg.fused_clip:
                 self._install_lowmem_clip_hook()
+            if cfg.ema_decay > 0.0:
+                self._cpu_ema = CpuShadowEMA(
+                    self.model,
+                    decay=cfg.ema_decay,
+                    update_every=cfg.ema_update_every,
+                )
+                self._install_cpu_ema_callback()
+
+        def _install_cpu_ema_callback(self) -> None:
+            from transformers import TrainerCallback
+
+            trainer_self = self
+            skip_names = {
+                "optimizer.pt",
+                "scheduler.pt",
+                "rng_state.pth",
+                "trainer_state.json",
+                "training_args.bin",
+                "scaler.pt",
+            }
+
+            class _CpuEmaCallback(TrainerCallback):
+                def __init__(self) -> None:
+                    self._saving_ema = False
+
+                def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+                    ema = trainer_self._cpu_ema
+                    if ema is not None:
+                        ema.update(int(state.global_step), optimizer=getattr(trainer_self, "optimizer", None))
+
+                def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+                    ema = trainer_self._cpu_ema
+                    if ema is None or self._saving_ema or not trainer_self.is_world_process_zero():
+                        return
+                    self._saving_ema = True
+                    try:
+                        step = int(state.global_step)
+                        raw_dir = Path(args.output_dir) / f"checkpoint-{step}"
+                        ema_dir = Path(args.output_dir) / f"checkpoint-{step}-ema"
+                        with ema.swap_into_model():
+                            trainer_self.save_model(str(ema_dir))
+                        if raw_dir.is_dir() and ema_dir.is_dir():
+                            for item in raw_dir.iterdir():
+                                dst = ema_dir / item.name
+                                if dst.exists() or item.name in skip_names:
+                                    continue
+                                if item.suffix in (".safetensors", ".bin") or item.name.endswith(".index.json"):
+                                    continue
+                                if item.is_dir():
+                                    shutil.copytree(item, dst, dirs_exist_ok=True)
+                                elif item.is_file():
+                                    shutil.copy2(item, dst)
+                        logger.info("[cpu-ema] saved EMA checkpoint -> %s (updates=%d)", ema_dir, ema.num_updates)
+                    finally:
+                        self._saving_ema = False
+
+            self.add_callback(_CpuEmaCallback())
 
         def _install_lowmem_clip_hook(self) -> None:
             accel = getattr(self, "accelerator", None)
@@ -431,11 +527,13 @@ def make_online_turbo_trainer_class(base_trainer_cls: type, cfg: OnlineTurboConf
                         betas=betas,
                         eps=eps,
                         backend=self._online_turbo_cfg.lowmem_backend,
+                        comp_dtype=self._online_turbo_cfg.lowmem_comp,
                         seed=self._online_turbo_cfg.seed,
                     )
                     logger.info(
-                        "[online-turbo] created LowMemAdamW (backend=%s, betas=%s, lr=%g, wd=%g)",
+                        "[online-turbo] created LowMemAdamW (backend=%s, comp=%s, betas=%s, lr=%g, wd=%g)",
                         self.optimizer.backend,
+                        self.optimizer.comp_dtype,
                         betas,
                         self.args.learning_rate,
                         self.args.weight_decay,

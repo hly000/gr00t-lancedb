@@ -64,6 +64,7 @@ _KV_BIAS = (127 - 31) << 3  # minifloat code 0 <-> 2**-31
 _X_MIN = 2.0**-31
 _X_MAX = 1.875
 _MASK32 = 0xFFFFFFFF
+_HALF_ULP_MIN = 2.0**-126
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,16 @@ def f32_to_bf16_bits(x: torch.Tensor) -> torch.Tensor:
     """float32 -> int16 bf16 bit pattern, round-to-nearest-even."""
     b = x.contiguous().view(torch.int32)
     return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16).to(torch.int16)
+
+
+def bf16_half_ulp_f32(bits16: torch.Tensor) -> torch.Tensor:
+    """0.5 * ulp(bf16(bits16)) as float32 via exponent bit-ops (zero scale storage)."""
+    exp_bits = bits16.to(torch.int32) & 0x7F80
+    return torch.where(
+        exp_bits >= (9 << 7),
+        ((exp_bits - (8 << 7)) << 16).view(torch.float32),
+        torch.full(bits16.shape, _HALF_ULP_MIN, dtype=torch.float32, device=bits16.device),
+    )
 
 
 def decode_v(code: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -180,10 +191,11 @@ def _update_tensor_torch(
 ) -> None:
     """One AdamW step for one tensor, ``chunk_blocks`` blocks at a time (bounded temporaries)."""
     kahan = comp is not None
+    comp_int8 = kahan and comp.dtype == torch.int8
     n = w.numel()
     nb = sr.numel()
     w_flat = w.view(torch.int16).reshape(-1) if kahan else w.reshape(-1)
-    c_flat = comp.view(torch.int16).reshape(-1) if kahan else None
+    c_flat = comp.reshape(-1) if comp_int8 else (comp.view(torch.int16).reshape(-1) if kahan else None)
     g_flat = grad.view(torch.int16).reshape(-1) if grad.dtype == torch.bfloat16 else grad.reshape(-1)
 
     for b0 in range(0, nb, chunk_blocks):
@@ -209,7 +221,12 @@ def _update_tensor_torch(
         v = beta2 * v_old + (1.0 - beta2) * g * g
         upd = (m * inv_bc1) / (torch.sqrt(v * inv_bc2) + eps)
 
-        if kahan:
+        if comp_int8:
+            w_bits_old = _load(w_flat)
+            eff = bf16_bits_to_f32(w_bits_old) + _load(c_flat).to(torch.float32) * (
+                bf16_half_ulp_f32(w_bits_old) * (1.0 / 127.0)
+            )
+        elif kahan:
             eff = bf16_bits_to_f32(_load(w_flat)) + bf16_bits_to_f32(_load(c_flat))
         else:
             eff = _load(w_flat).to(torch.float32)
@@ -226,7 +243,14 @@ def _update_tensor_torch(
             r[-1, BLOCK - pad :] = 0.0
         kr, sr_new = encode_r(r, u24)
 
-        if kahan:
+        if comp_int8:
+            w_bits = f32_to_bf16_bits(new)
+            half_ulp = bf16_half_ulp_f32(w_bits)
+            err = new - bf16_bits_to_f32(w_bits)
+            qc = torch.round((err / half_ulp) * 127.0).clamp(-127.0, 127.0).to(torch.int8)
+            w_flat[s:e] = w_bits.reshape(-1)[:cnt]
+            c_flat[s:e] = qc.reshape(-1)[:cnt]
+        elif kahan:
             w_bits = f32_to_bf16_bits(new)
             c_bits = f32_to_bf16_bits(new - bf16_bits_to_f32(w_bits))
             w_flat[s:e] = w_bits.reshape(-1)[:cnt]
@@ -276,6 +300,7 @@ class LowMemAdamW(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         *,
         backend: str = "auto",
+        comp_dtype: str = "bf16",
         seed: int = 0,
         chunk_blocks: int = 1 << 13,
     ) -> None:
@@ -285,10 +310,13 @@ class LowMemAdamW(torch.optim.Optimizer):
             raise ValueError(f"invalid betas {betas}")
         if backend not in ("auto", "torch", "triton"):
             raise ValueError(f"unknown backend {backend!r}")
+        if comp_dtype not in ("bf16", "int8"):
+            raise ValueError(f"comp_dtype must be 'bf16' or 'int8', got {comp_dtype!r}")
         if backend == "triton" and not triton_available():
             raise RuntimeError("backend='triton' needs CUDA and an importable triton")
         super().__init__(params, {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay})
         self.backend = backend
+        self.comp_dtype = comp_dtype
         self.seed = int(seed)
         self.chunk_blocks = int(chunk_blocks)
         self._kernel: Callable[..., None] | None = None
@@ -311,7 +339,10 @@ class LowMemAdamW(torch.optim.Optimizer):
         st["sr"] = torch.zeros(nb, dtype=torch.float32, device=p.device)
         st["sv"] = torch.zeros(nb, dtype=torch.float32, device=p.device)
         if p.dtype == torch.bfloat16:
-            st["comp"] = torch.zeros_like(p)
+            if self.comp_dtype == "int8":
+                st["comp"] = torch.zeros(p.shape, dtype=torch.int8, device=p.device)
+            else:
+                st["comp"] = torch.zeros_like(p)
         return st
 
     def state_bytes(self) -> int:
@@ -342,10 +373,9 @@ class LowMemAdamW(torch.optim.Optimizer):
             by_key.setdefault((g.device, g.dtype), []).append(g)
         norms: list[torch.Tensor] = []
         for (_, dtype), bucket in by_key.items():
-            # _foreach_norm avoids ~300 per-tensor kernel launches on the GR00T action head.
-            # For fp32 grads it accumulates in fp32 directly; for bf16 we keep fp32 accumulation
-            # via vector_norm only if _foreach_norm is unavailable, or upcast small norms to fp32.
-            if hasattr(torch, "_foreach_norm") and dtype == torch.float32:
+            # _foreach_norm avoids ~500 per-tensor kernel launches on the GR00T action head.
+            # On PyTorch 2.x CUDA it accumulates fp32 internally for both fp32 and bf16.
+            if hasattr(torch, "_foreach_norm") and dtype in (torch.float32, torch.bfloat16):
                 norms.extend(n.to(torch.float32) for n in torch._foreach_norm(bucket, 2.0))
             else:
                 norms.extend(torch.linalg.vector_norm(g, dtype=torch.float32) for g in bucket)
@@ -358,7 +388,11 @@ class LowMemAdamW(torch.optim.Optimizer):
         st = self.state.get(p)
         if st is None or "comp" not in st:
             return p.detach().to(torch.float32)
-        return p.detach().to(torch.float32) + st["comp"].to(torch.float32)
+        comp = st["comp"]
+        if comp.dtype == torch.int8:
+            wb = p.detach().view(torch.int16)
+            return bf16_bits_to_f32(wb) + comp.to(torch.float32) * (bf16_half_ulp_f32(wb) * (1.0 / 127.0))
+        return p.detach().to(torch.float32) + comp.to(torch.float32)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # torch casts every state tensor to the parameter's dtype on load, which would turn

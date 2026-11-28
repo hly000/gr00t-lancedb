@@ -15,8 +15,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
-from .lowmem_adamw import BLOCK, _C1, _C2, _GOLDEN, _KV_BIAS, _X_MAX, _X_MIN
+from .lowmem_adamw import BLOCK, _C1, _C2, _GOLDEN, _HALF_ULP_MIN, _KV_BIAS, _X_MAX, _X_MIN
 
 ROWS = 8
 NUM_WARPS = 4
@@ -44,6 +45,16 @@ def _f32_to_bf16(x):
 
 
 @triton.jit
+def _bf16_half_ulp_f32(bits16, HALF_ULP_MIN: tl.constexpr):
+    exp_bits = bits16.to(tl.int32) & 0x7F80
+    return tl.where(
+        exp_bits >= (9 << 7),
+        ((exp_bits - (8 << 7)) << 16).to(tl.float32, bitcast=True),
+        HALF_ULP_MIN,
+    )
+
+
+@triton.jit
 def _lowmem_adamw_kernel(
     w_ptr,
     c_ptr,
@@ -65,12 +76,14 @@ def _lowmem_adamw_kernel(
     grad_scale,
     seed,
     KAHAN: tl.constexpr,
+    COMP_INT8: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
     KV_BIAS: tl.constexpr,
     X_MIN: tl.constexpr,
     X_MAX: tl.constexpr,
     GOLDEN: tl.constexpr,
+    HALF_ULP_MIN: tl.constexpr,
 ):
     pid = tl.program_id(0)
     blk = pid * ROWS + tl.arange(0, ROWS)
@@ -94,7 +107,11 @@ def _lowmem_adamw_kernel(
     v = beta2 * v_old + one_minus_beta2 * g * g
     upd = (m * inv_bc1) / (tl.sqrt(v * inv_bc2) + eps)
 
-    if KAHAN:
+    if COMP_INT8:
+        wb_old = tl.load(w_ptr + offs, mask=mask, other=0)
+        qc_old = tl.load(c_ptr + offs, mask=mask, other=0).to(tl.float32)
+        eff = _bf16_to_f32(wb_old) + qc_old * (_bf16_half_ulp_f32(wb_old, HALF_ULP_MIN) * (1.0 / 127.0))
+    elif KAHAN:
         eff = _bf16_to_f32(tl.load(w_ptr + offs, mask=mask, other=0)) + _bf16_to_f32(
             tl.load(c_ptr + offs, mask=mask, other=0)
         )
@@ -127,7 +144,16 @@ def _lowmem_adamw_kernel(
     kr = fl + (u24 < (y - fl.to(tl.float32))).to(tl.int32) - 127
     kr = tl.minimum(tl.maximum(kr, -127), 127)
 
-    if KAHAN:
+    if COMP_INT8:
+        wb = _f32_to_bf16(new)
+        wb16 = wb.to(tl.int16)
+        half_ulp = _bf16_half_ulp_f32(wb16, HALF_ULP_MIN)
+        err = new - (wb << 16).to(tl.float32, bitcast=True)
+        qc = libdevice.rint((err / half_ulp) * 127.0)
+        qc = tl.minimum(tl.maximum(qc, -127.0), 127.0).to(tl.int8)
+        tl.store(w_ptr + offs, wb16, mask=mask)
+        tl.store(c_ptr + offs, qc, mask=mask)
+    elif KAHAN:
         wb = _f32_to_bf16(new)
         cb = _f32_to_bf16(new - (wb << 16).to(tl.float32, bitcast=True))
         tl.store(w_ptr + offs, wb.to(tl.int16), mask=mask)
@@ -160,10 +186,13 @@ def update_tensor_triton(
     seed: int,
 ) -> None:
     kahan = comp is not None
+    comp_int8 = kahan and comp.dtype == torch.int8
     n = w.numel()
     if n == 0:
         return
-    if kahan:
+    if comp_int8:
+        w_arg, c_arg, g_arg = w.view(torch.int16), comp, grad.view(torch.int16)
+    elif kahan:
         w_arg, c_arg, g_arg = w.view(torch.int16), comp.view(torch.int16), grad.view(torch.int16)
     else:
         w_arg, c_arg, g_arg = w, w, grad  # c_ptr is never dereferenced when KAHAN is False
@@ -189,12 +218,14 @@ def update_tensor_triton(
         grad_scale,
         seed,
         KAHAN=kahan,
+        COMP_INT8=comp_int8,
         ROWS=ROWS,
         BLOCK=BLOCK,
         KV_BIAS=_KV_BIAS,
         X_MIN=_X_MIN,
         X_MAX=_X_MAX,
         GOLDEN=_GOLDEN,
+        HALF_ULP_MIN=_HALF_ULP_MIN,
         num_warps=NUM_WARPS,
     )
 

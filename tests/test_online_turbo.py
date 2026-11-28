@@ -484,3 +484,48 @@ def test_fused_clip_hook_only_when_enabled(tmp_path: Path) -> None:
         cfg = OnlineTurboConfig(optimizer="lowmem", lowmem_backend="torch", bf16_weights=True, fused_clip=fused_clip)
         trainer = make_online_turbo_trainer_class(transformers.Trainer, cfg)(model=_FakeGr00tModel(), args=args)
         assert bool(getattr(trainer.accelerator, "_lowmem_clip_hooked", False)) is fused_clip
+
+
+def test_plan09_config_env_grad_ckpt_and_int8_comp(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "GR00T_TURBO_LOWMEM_COMP",
+        "GR00T_TURBO_GRAD_CKPT_HEAD",
+        "GR00T_TURBO_EMA_DECAY",
+        "GR00T_TURBO_EMA_EVERY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    default_cfg = OnlineTurboConfig.from_env()
+    assert default_cfg.lowmem_comp == "bf16"
+    assert default_cfg.grad_ckpt_head is False
+    assert default_cfg.ema_decay == 0.0
+    assert default_cfg.ema_update_every == 10
+
+    monkeypatch.setenv("GR00T_TURBO_LOWMEM_COMP", "int8")
+    monkeypatch.setenv("GR00T_TURBO_GRAD_CKPT_HEAD", "1")
+    monkeypatch.setenv("GR00T_TURBO_EMA_DECAY", "0.995")
+    monkeypatch.setenv("GR00T_TURBO_EMA_EVERY", "5")
+    cfg = OnlineTurboConfig.from_env()
+    assert cfg.enabled and cfg.lowmem_comp == "int8" and cfg.grad_ckpt_head is True
+    assert cfg.ema_decay == pytest.approx(0.995) and cfg.ema_update_every == 5
+
+    with pytest.raises(ValueError, match="lowmem_comp"):
+        OnlineTurboConfig(lowmem_comp="fp8")
+    with pytest.raises(ValueError, match="ema_decay"):
+        OnlineTurboConfig(ema_decay=1.0)
+
+    # apply_online_turbo enables gradient_checkpointing on action_head.model (both method & attribute paths)
+    model = _FakeGr00tModel()
+    info = apply_online_turbo(model, OnlineTurboConfig(grad_ckpt_head=True))
+    assert info["grad_ckpt_head_applied"] is True
+    assert getattr(model.action_head.model, "gradient_checkpointing", False) is True
+
+    called: list[Any] = []
+
+    def _enable(gradient_checkpointing_kwargs: Any = None) -> None:
+        called.append(gradient_checkpointing_kwargs)
+
+    model2 = _FakeGr00tModel()
+    model2.action_head.model.gradient_checkpointing_enable = _enable  # type: ignore[attr-defined]
+    info2 = apply_online_turbo(model2, OnlineTurboConfig(grad_ckpt_head=True))
+    assert info2["grad_ckpt_head_applied"] is True
+    assert called == [{"use_reentrant": False}]
