@@ -1,0 +1,22 @@
+{
+  "base_model_path": "nvidia/GR00T-N1.7-3B",
+  "dataset_path": "/data/datasets/libero_10_lance",
+  "max_steps": 3000,
+  "frames_per_step": 32,
+  "multi_noise": 1,
+  "effective_batch_size": 32,
+  "compile": false,
+  "token_dropout": 0.0,
+  "gaussian_jitter": 0.0,
+  "optimizer": "torch.AdamW(fused)",
+  "materialize_s": 2665.49,
+  "train_loop_s": 742.21,
+  "train_total_wall_s": 791.04,
+  "median_step_ms": 244.05,
+  "peak_alloc_gb": 27.27,
+  "peak_reserved_gb": 30.955,
+  "final_loss_mean50": 0.1316,
+  "save_action_head_s": 11.36,
+  "export_merged_s": 18.46,
+  "merged_checkpoint_dir": "/data/runs/e2e_ablation_3000s/group2_v3_bf16_lossless/merged_gr00t_ckpt"
+}
